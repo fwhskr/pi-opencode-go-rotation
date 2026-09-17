@@ -248,6 +248,18 @@ function getQuotaBlockedUntil(config: Config, keyIndex: number, now: number): nu
 		: undefined;
 }
 
+/** Keys held by a live recorded block, optionally ignoring the key that just failed. */
+function getQuotaBlockedTargets(config: Config, now: number, skipKeyIndex?: number): UsageLookupTarget[] {
+	const targets: UsageLookupTarget[] = [];
+	for (let keyIndex = 0; keyIndex < config.keys.length; keyIndex++) {
+		if (keyIndex === skipKeyIndex) continue;
+		if (getQuotaBlockedUntil(config, keyIndex, now) === undefined) continue;
+		const target = getUsageTargetForKeyIndex(config, keyIndex);
+		if (target) targets.push(target);
+	}
+	return targets;
+}
+
 function pickAvailableKeyIndex(config: Config, now = Date.now()): number | undefined {
 	const cdMs = getCooldownMs(config);
 	for (let i = 0; i < config.keys.length; i++) {
@@ -309,14 +321,18 @@ function applyActiveKey(config: Config, modelRegistry: { authStorage?: RuntimeKe
 	return config.keys[idx].name || `key-${idx + 1}`;
 }
 
-function getActiveUsageTarget(config: Config): UsageLookupTarget | undefined {
-	const entry = config.keys[config.activeKeyIndex];
+function getUsageTargetForKeyIndex(config: Config, keyIndex: number): UsageLookupTarget | undefined {
+	const entry = config.keys[keyIndex];
 	if (!entry) return undefined;
 	return {
-		keyIndex: config.activeKeyIndex,
-		keyName: entry.name || `key-${config.activeKeyIndex + 1}`,
+		keyIndex,
+		keyName: entry.name || `key-${keyIndex + 1}`,
 		bearerToken: entry.key,
 	};
+}
+
+function getActiveUsageTarget(config: Config): UsageLookupTarget | undefined {
+	return getUsageTargetForKeyIndex(config, config.activeKeyIndex);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -452,6 +468,17 @@ function isCurrentUsageDecision(decision: UsageDecisionIdentity, config: Config,
 
 function hasRateLimitedUsageWindow(result: UsageFetchResult): boolean {
 	return result.ok && result.usage.windows.some((window) => window.status === "rate-limited");
+}
+
+/**
+ * A recorded block can go stale: the plan was topped up, or the window reset before the
+ * deadline we stored. Only a clean reading releases it -- a failed or unrecognised usage
+ * response is not evidence of headroom.
+ */
+function hasConfirmedHeadroom(result: UsageFetchResult): boolean {
+	return result.ok
+		&& result.usage.windows.some((window) => window.status === "active")
+		&& !hasRateLimitedUsageWindow(result);
 }
 
 function getRateLimitedUntil(usage: OpenCodeGoUsageResponse, now: number, fallbackMs: number): number {
@@ -726,17 +753,71 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 			};
 		}
 
-		function rotateForQuotaExhaustion(
+		/**
+		 * A benched key can become usable again after we recorded its block. Before concluding
+		 * that every key is exhausted, re-check the blocked keys and release the ones the usage
+		 * endpoint no longer reports as rate-limited.
+		 */
+		async function releaseRecoveredQuotaBlocks(
+			ctx: Pick<ExtensionContext, "ui">,
+			currentTime: number,
+			skipKeyIndex?: number,
+		): Promise<boolean> {
+			const targets = getQuotaBlockedTargets(config, currentTime, skipKeyIndex);
+			let released = false;
+			for (const target of targets) {
+				const usage = await fetchOpenCodeGoUsage(target, fetchApi, options.timers);
+				if (!refreshConfig()) return released;
+				if (!hasConfirmedHeadroom(usage)) continue;
+				const cleared = mutateSharedConfig((freshConfig) => {
+					const entry = freshConfig.keys[target.keyIndex];
+					if (!entry || entry.key !== target.bearerToken) return false;
+					if (getQuotaBlockedUntil(freshConfig, target.keyIndex, currentTime) === undefined) return false;
+					delete freshConfig.quotaBlockedUntil[target.keyIndex];
+					delete freshConfig.cooldowns[target.keyIndex];
+					return true;
+				});
+				if (cleared !== true) continue;
+				released = true;
+				ctx.ui.notify(`OpenCode: ${target.keyName} has headroom again → quota block cleared`, "info");
+			}
+			return released;
+		}
+
+		/**
+		 * Rotate to a different key, re-verifying benched keys first. `undefined` means no
+		 * rotation happened, so the caller must not report one.
+		 */
+		async function rotateAfterRevalidation(
+			ctx: Pick<ExtensionContext, "modelRegistry" | "ui">,
+			currentTime: number,
+		): Promise<number | undefined> {
+			const previousIndex = config.activeKeyIndex;
+			let nextIndex = mutateSharedConfig((freshConfig) => rotateToNextKey(freshConfig, { now: currentTime }));
+			if (nextIndex === undefined || nextIndex === previousIndex) {
+				if (await releaseRecoveredQuotaBlocks(ctx, currentTime, previousIndex)) {
+					nextIndex = mutateSharedConfig((freshConfig) => rotateToNextKey(freshConfig, { now: currentTime }));
+				}
+			}
+			return nextIndex === previousIndex ? undefined : nextIndex;
+		}
+
+		async function rotateForQuotaExhaustion(
 			ctx: Pick<ExtensionContext, "modelRegistry" | "ui">,
 			keyIndex: number,
 			blockedUntil: number,
 			currentTime: number,
 			isAuthoritative = false,
-		): void {
+		): Promise<void> {
 			const exhaustedName = config.keys[keyIndex]?.name || `key-${keyIndex + 1}`;
-			const nextIndex = mutateSharedConfig((freshConfig) =>
+			let nextIndex = mutateSharedConfig((freshConfig) =>
 				blockQuotaAndSelectNext(freshConfig, keyIndex, blockedUntil, currentTime, isAuthoritative),
 			);
+			if (nextIndex === undefined && (await releaseRecoveredQuotaBlocks(ctx, currentTime, keyIndex))) {
+				nextIndex = mutateSharedConfig((freshConfig) =>
+					blockQuotaAndSelectNext(freshConfig, keyIndex, blockedUntil, currentTime, isAuthoritative),
+				);
+			}
 			if (nextIndex === undefined) {
 				if (configError) {
 					ctx.ui.notify(`OpenCode: ${configError}. Automatic rotation was skipped.`, "error");
@@ -852,6 +933,16 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 			requestRateLimitState = undefined;
 			clearWatchdogTimeoutGuard();
 			if (!ensureConfig(ctx)) return;
+			// A block recorded in an earlier session can be stale: the plan was topped up, or the
+			// window reset before the deadline we stored. Re-check before it decides which key this
+			// session uses, rather than benching a key that is usable again -- or leaving every key
+			// held by a block with nothing left to rotate to.
+			if (config.keys.length > 0) {
+				const activeBlocked = getQuotaBlockedUntil(config, config.activeKeyIndex, now()) !== undefined;
+				if (activeBlocked || pickAvailableKeyIndex(config, now()) === undefined) {
+					await releaseRecoveredQuotaBlocks(ctx, now());
+				}
+			}
 			// On reload: re-apply active key, skip auto-import
 			if (event.reason === "reload") {
 				const keyName = applySynchronizedActiveKey(ctx);
@@ -939,7 +1030,7 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 					invalidateAutomaticDecisions();
 					return;
 				}
-				rotateForQuotaExhaustion(
+				await rotateForQuotaExhaustion(
 					ctx,
 					requestState.decision.target.keyIndex,
 					blockedUntil,
@@ -960,7 +1051,7 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 			}
 
 			const currentTime = now();
-			const newIndex = mutateSharedConfig((freshConfig) => rotateToNextKey(freshConfig, { now: currentTime }));
+			const newIndex = await rotateAfterRevalidation(ctx, currentTime);
 			if (newIndex === undefined) {
 				if (configError) ctx.ui.notify(`OpenCode: ${configError}. Automatic rotation was skipped.`, "error");
 				else {
@@ -988,7 +1079,7 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 			if (!isCurrentUsageDecision(decision, config, usageDecisionEpoch)) return;
 			if (usage.ok && hasRateLimitedUsageWindow(usage)) {
 				const currentTime = now();
-				rotateForQuotaExhaustion(
+				await rotateForQuotaExhaustion(
 					ctx,
 					decision.target.keyIndex,
 					getRateLimitedUntil(usage.usage, currentTime, getCooldownMs(config)),
@@ -1005,7 +1096,7 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 			}
 
 			const currentTime = now();
-			const newIndex = mutateSharedConfig((freshConfig) => rotateToNextKey(freshConfig, { now: currentTime }));
+			const newIndex = await rotateAfterRevalidation(ctx, currentTime);
 			if (newIndex === undefined) {
 				if (configError) ctx.ui.notify(`OpenCode: ${configError}. Automatic rotation was skipped.`, "error");
 				else {
