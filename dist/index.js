@@ -200,9 +200,11 @@ function sanitizeReasoningPayload(payload) {
                 return unsigned;
             });
             const reasoning_details = projected.filter((detail) => detail !== droppedReasoningDetail);
-            const dropped = projected.length !== reasoning_details.length;
             const { reasoning_details: _details, ...visible } = entry;
-            return dropped && reasoning_details.length === 0 ? visible : { ...visible, reasoning_details };
+            // Strip the key entirely when nothing remains to send: an empty array is an
+            // unvalidated request shape, and this sanitiser exists to emit only shapes the
+            // provider accepts. Non-detail entries above keep identity/position/shape.
+            return reasoning_details.length === 0 ? visible : { ...visible, reasoning_details };
         });
     }
     if (Array.isArray(request.input)) {
