@@ -174,6 +174,7 @@ function rotateToNextKey(config, options = {}) {
 // Key equality detects credential changes, but persisted history has no issuer
 // provenance (including after reload). Never replay signed reasoning on this
 // rotating route, even before this process observes its first rotation.
+const droppedReasoningDetail = Symbol("dropped-caller-bound-reasoning");
 function sanitizeReasoningPayload(payload) {
     if (!payload || typeof payload !== "object" || Array.isArray(payload))
         return payload;
@@ -186,17 +187,22 @@ function sanitizeReasoningPayload(payload) {
             const entry = message;
             if (entry.role !== "assistant" || !Array.isArray(entry.reasoning_details))
                 return message;
-            const reasoning_details = entry.reasoning_details.flatMap((detail) => {
-                if (!detail || typeof detail !== "object")
-                    return [detail];
+            // map/filter, never flatMap: entries that are not plain reasoning detail
+            // objects (nested arrays, numbers, booleans, ...) must pass through as the
+            // same element in the same position, with their original shape intact.
+            const projected = entry.reasoning_details.map((detail) => {
+                if (!detail || typeof detail !== "object" || Array.isArray(detail))
+                    return detail;
                 const item = detail;
                 if (item.type === "reasoning.encrypted")
-                    return [];
+                    return droppedReasoningDetail;
                 const { signature: _signature, ...unsigned } = item;
-                return [unsigned];
+                return unsigned;
             });
+            const reasoning_details = projected.filter((detail) => detail !== droppedReasoningDetail);
+            const dropped = projected.length !== reasoning_details.length;
             const { reasoning_details: _details, ...visible } = entry;
-            return reasoning_details.length ? { ...visible, reasoning_details } : visible;
+            return dropped && reasoning_details.length === 0 ? visible : { ...visible, reasoning_details };
         });
     }
     if (Array.isArray(request.input)) {

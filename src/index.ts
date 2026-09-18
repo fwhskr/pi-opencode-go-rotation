@@ -299,7 +299,9 @@ interface RuntimeKeyStore {
 // Key equality detects credential changes, but persisted history has no issuer
 // provenance (including after reload). Never replay signed reasoning on this
 // rotating route, even before this process observes its first rotation.
-function sanitizeReasoningPayload(payload: unknown): unknown {
+const droppedReasoningDetail = Symbol("dropped-caller-bound-reasoning");
+
+function sanitizeReasoningPayload<T>(payload: T): T {
 	if (!payload || typeof payload !== "object" || Array.isArray(payload)) return payload;
 	const request = payload as Record<string, unknown>;
 	const result = { ...request };
@@ -308,22 +310,27 @@ function sanitizeReasoningPayload(payload: unknown): unknown {
 			if (!message || typeof message !== "object") return message;
 			const entry = message as Record<string, unknown>;
 			if (entry.role !== "assistant" || !Array.isArray(entry.reasoning_details)) return message;
-			const reasoning_details = entry.reasoning_details.flatMap((detail: unknown) => {
-				if (!detail || typeof detail !== "object") return [detail];
+			// map/filter, never flatMap: entries that are not plain reasoning detail
+			// objects (nested arrays, numbers, booleans, ...) must pass through as the
+			// same element in the same position, with their original shape intact.
+			const projected = entry.reasoning_details.map((detail: unknown) => {
+				if (!detail || typeof detail !== "object" || Array.isArray(detail)) return detail;
 				const item = detail as Record<string, unknown>;
-				if (item.type === "reasoning.encrypted") return [];
+				if (item.type === "reasoning.encrypted") return droppedReasoningDetail;
 				const { signature: _signature, ...unsigned } = item;
-				return [unsigned];
+				return unsigned;
 			});
+			const reasoning_details = projected.filter((detail) => detail !== droppedReasoningDetail);
+			const dropped = projected.length !== reasoning_details.length;
 			const { reasoning_details: _details, ...visible } = entry;
-			return reasoning_details.length ? { ...visible, reasoning_details } : visible;
+			return dropped && reasoning_details.length === 0 ? visible : { ...visible, reasoning_details };
 		});
 	}
 	if (Array.isArray(request.input)) {
 		result.input = request.input.filter((item: unknown) =>
 			!item || typeof item !== "object" || (item as Record<string, unknown>).type !== "reasoning");
 	}
-	return result;
+	return result as T;
 }
 
 const lastAppliedRuntimeKeys = new WeakMap<object, string>();
