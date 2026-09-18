@@ -171,6 +171,39 @@ function rotateToNextKey(config, options = {}) {
     }
     return undefined;
 }
+// Key equality detects credential changes, but persisted history has no issuer
+// provenance (including after reload). Never replay signed reasoning on this
+// rotating route, even before this process observes its first rotation.
+function sanitizeReasoningPayload(payload) {
+    if (!payload || typeof payload !== "object" || Array.isArray(payload))
+        return payload;
+    const request = payload;
+    const result = { ...request };
+    if (Array.isArray(request.messages)) {
+        result.messages = request.messages.map((message) => {
+            if (!message || typeof message !== "object")
+                return message;
+            const entry = message;
+            if (entry.role !== "assistant" || !Array.isArray(entry.reasoning_details))
+                return message;
+            const reasoning_details = entry.reasoning_details.flatMap((detail) => {
+                if (!detail || typeof detail !== "object")
+                    return [detail];
+                const item = detail;
+                if (item.type === "reasoning.encrypted")
+                    return [];
+                const { signature: _signature, ...unsigned } = item;
+                return [unsigned];
+            });
+            const { reasoning_details: _details, ...visible } = entry;
+            return reasoning_details.length ? { ...visible, reasoning_details } : visible;
+        });
+    }
+    if (Array.isArray(request.input)) {
+        result.input = request.input.filter((item) => !item || typeof item !== "object" || item.type !== "reasoning");
+    }
+    return result;
+}
 const lastAppliedRuntimeKeys = new WeakMap();
 function getRuntimeKeyStore(modelRegistry) {
     const store = modelRegistry.authStorage ?? modelRegistry.runtime;
@@ -817,7 +850,7 @@ export function createOpencodeGoRotationExtension(options = {}) {
             if (keyName)
                 ctx.ui.notify(`OpenCode: Active key → ${keyName}`, "info");
         });
-        pi.on("before_provider_request", (_event, ctx) => {
+        pi.on("before_provider_request", (event, ctx) => {
             if (!shouldWatchProvider(ctx.model?.provider)) {
                 invalidateAutomaticDecisions();
                 requestRateLimitState = undefined;
@@ -828,6 +861,7 @@ export function createOpencodeGoRotationExtension(options = {}) {
             }
             beginProviderRequest(ctx);
             startWatchdog(ctx);
+            return sanitizeReasoningPayload(event.payload);
         });
         pi.on("message_update", (event) => {
             const message = event.message;
