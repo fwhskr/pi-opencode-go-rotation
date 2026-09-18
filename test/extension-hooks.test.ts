@@ -1,5 +1,8 @@
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
+import type { AnthropicOptions, Context, Usage } from "@mariozechner/pi-ai";
+import { getModel, streamAnthropic } from "@mariozechner/pi-ai";
 import type { FetchApi, OpenCodeGoUsageWindow } from "../src/index.ts";
+import { updateConfig, type Config } from "../src/config-store.ts";
 import { chmodSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -140,8 +143,28 @@ function readConfig(path: string): {
 	activeKeyIndex: number;
 	cooldowns: Record<string, number>;
 	quotaBlockedUntil?: Record<string, number>;
+	keys: Array<{ name: string; key: string }>;
 } {
 	return JSON.parse(readFileSync(path, "utf-8"));
+}
+
+function patchConfig(path: string, patch: Record<string, unknown>): void {
+	const persisted = JSON.parse(readFileSync(path, "utf-8"));
+	writeFileSync(path, JSON.stringify({ ...persisted, ...patch }), { mode: 0o600 });
+}
+
+function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
+	let resolve: (value: T) => void = () => {};
+	const promise = new Promise<T>((settle) => {
+		resolve = settle;
+	});
+	return { promise, resolve };
+}
+
+const activeUsage = (name = "weekly") => usageResponse([{ name, status: "active" }]);
+
+function usageResponse(windows: OpenCodeGoUsageWindow[]): Awaited<ReturnType<FetchApi>> {
+	return { ok: true, status: 200, json: async () => ({ windows }) };
 }
 
 
@@ -994,6 +1017,35 @@ test("status reloads mutations made by another live session", async () => {
 	});
 });
 
+test("usage reset deadlines start when the delayed response arrives", async () => {
+	await withTempConfig(async (configPath) => {
+		const usage = deferred<Awaited<ReturnType<FetchApi>>>();
+		const { pi, ctx, clock } = createHarness("authStorage", async () => usage.promise);
+		await pi.emit("session_start", { reason: "start" }, ctx);
+		await pi.emit("before_provider_request", {}, ctx);
+		const pending = pi.emit("after_provider_response", { status: 429 }, ctx);
+		clock.advance(5_000);
+		usage.resolve(usageResponse([{ status: "rate-limited", resetInSec: 600 }]));
+		await pending;
+		assert.equal(readConfig(configPath).quotaBlockedUntil?.["0"], 605_000);
+	});
+});
+
+test("a shared key selection cancels the old fast-path runtime application", async () => {
+	await withTempConfig(async () => {
+		const { pi, ctx, state } = createHarness();
+		await pi.emit("session_start", { reason: "start" }, ctx);
+		await pi.emit("before_provider_request", {}, ctx);
+		const pending = pi.emit("message_end", {
+			message: { role: "assistant", provider: "opencode-go", stopReason: "error", errorMessage: "429 Too Many Requests" },
+		}, ctx);
+		updateConfig((config) => { config.activeKeyIndex = 2; });
+		await pending;
+		assert.deepEqual(state.runtimeKeys, ["sk-one"]);
+		assert.equal(state.notifications.some((message) => /Rate-limited → rotated/.test(message)), false);
+	});
+});
+
 test("config writes restore private file permissions", async () => {
 	await withTempConfig(async (configPath) => {
 		chmodSync(configPath, 0o644);
@@ -1002,5 +1054,496 @@ test("config writes restore private file permissions", async () => {
 		await pi.runCommand("opencode", "reset", ctx);
 
 		assert.equal(statSync(configPath).mode & 0o777, 0o600);
+	});
+});
+
+// ---------------------------------------------------------------------------
+// Caller-bound reasoning projection (Chat Completions, Responses, Anthropic)
+// ---------------------------------------------------------------------------
+
+const toolMessage = { role: "tool", tool_call_id: "done", content: "Saved" };
+const responsesToolResult = { type: "function_call_output", call_id: "done", output: "Saved" };
+const nestedReasoningEntry = [{ signature: "nested" }];
+const emptyReasoningEntry: unknown[] = [];
+
+for (const { name, payload, expected } of [
+	{
+		name: "keeps Chat Completions reasoning shape without caller-bound entries",
+		payload: {
+			messages: [
+				{
+					role: "assistant",
+					content: "Visible",
+					tool_calls: [{ id: "done", type: "function", function: { name: "write", arguments: "{}" } }],
+					reasoning_details: [
+						{ type: "reasoning.encrypted", data: "opaque" },
+						{ type: "reasoning.text", text: "Thought", signature: "caller-bound" },
+						nestedReasoningEntry,
+						emptyReasoningEntry,
+						7,
+						true,
+					],
+				},
+				toolMessage,
+			],
+		},
+		expected: {
+			messages: [
+				{
+					role: "assistant",
+					content: "Visible",
+					tool_calls: [{ id: "done", type: "function", function: { name: "write", arguments: "{}" } }],
+					reasoning_details: [{ type: "reasoning.text", text: "Thought" }, nestedReasoningEntry, emptyReasoningEntry, 7, true],
+				},
+				toolMessage,
+			],
+		},
+	},
+	{
+		name: "strips only the reasoning_details key when every entry is opaque",
+		payload: { messages: [{ role: "assistant", content: "Kept", reasoning_details: [{ type: "reasoning.encrypted", data: "opaque" }] }] },
+		expected: { messages: [{ role: "assistant", content: "Kept" }] },
+	},
+	{
+		name: "drops Responses reasoning items before function call output",
+		payload: { input: [{ type: "reasoning", encrypted_content: "opaque" }, responsesToolResult] },
+		expected: { input: [responsesToolResult] },
+	},
+	{
+		name: "projects Anthropic thinking to visible text and drops opaque reasoning",
+		payload: {
+			messages: [{
+				role: "assistant",
+				content: [
+					{ type: "thinking", thinking: "Visible thought", signature: "caller-bound-signature" },
+					{ type: "redacted_thinking", data: "caller-bound-ciphertext" },
+					{ type: "text", text: "Visible answer" },
+					{ type: "tool_use", id: "done", name: "write", input: {} },
+				],
+			}],
+		},
+		expected: {
+			messages: [{
+				role: "assistant",
+				content: [
+					{ type: "text", text: "Visible thought" },
+					{ type: "text", text: "Visible answer" },
+					{ type: "tool_use", id: "done", name: "write", input: {} },
+				],
+			}],
+		},
+	},
+	{
+		name: "omits only assistant messages emptied by the Anthropic projection",
+		payload: {
+			messages: [
+				{ role: "user", content: "Go" },
+				{ role: "assistant", content: [{ type: "redacted_thinking", data: "opaque" }] },
+				{ role: "assistant", content: [{ type: "thinking", thinking: "   ", signature: "sig" }] },
+				{ role: "assistant", content: [] },
+				{ role: "assistant", content: "Kept" },
+			],
+		},
+		expected: {
+			messages: [
+				{ role: "user", content: "Go" },
+				{ role: "assistant", content: [] },
+				{ role: "assistant", content: "Kept" },
+			],
+		},
+	},
+]) {
+	test(`before_provider_request ${name}`, async () => {
+		await withTempConfig(async () => {
+			const { pi, ctx, state } = createHarness();
+			const original = structuredClone(payload);
+
+			const output = await pi.emit("before_provider_request", { payload }, ctx);
+
+			assert.deepEqual(output, expected);
+			assert.deepEqual(payload, original);
+			Object.assign(ctx, { model: { provider: "deepseek", baseUrl: "https://api.deepseek.com" } });
+			assert.equal(await pi.emit("before_provider_request", { payload }, ctx), undefined);
+			assert.equal(state.runtimeKeys.length, 1);
+		});
+	});
+}
+
+test("chat and responses projection preserves element identity and other blocks", async () => {
+	await withTempConfig(async () => {
+		const { pi, ctx } = createHarness();
+		const tool = { role: "tool", tool_call_id: "done", content: "Saved" };
+		const assistant = {
+			role: "assistant",
+			content: "Visible",
+			tool_calls: [{ id: "done", type: "function", function: { name: "write", arguments: "{}" } }],
+			reasoning_details: [
+				{ type: "reasoning.encrypted", data: "opaque" },
+				{ type: "reasoning.text", text: "Thought", signature: "sig" },
+				nestedReasoningEntry,
+				emptyReasoningEntry,
+				7,
+				true,
+			],
+		};
+		const payload = { messages: [assistant, tool] };
+
+		// The hook returns the replacement payload as `unknown`; this test inspects its identity.
+		const output = await pi.emit("before_provider_request", { payload }, ctx) as {
+			messages: Array<{ reasoning_details: unknown[]; tool_calls: unknown }>;
+		};
+
+		assert.equal(output.messages[0].reasoning_details[1], nestedReasoningEntry);
+		assert.equal(output.messages[0].reasoning_details[2], emptyReasoningEntry);
+		assert.equal(output.messages[0].tool_calls, assistant.tool_calls);
+		assert.equal(output.messages[1], tool);
+	});
+});
+
+const zeroUsage: Usage = {
+	input: 0,
+	output: 0,
+	cacheRead: 0,
+	cacheWrite: 0,
+	totalTokens: 0,
+	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+};
+
+async function serializeAnthropicTurn(history: Context): Promise<unknown> {
+	const model = getModel("opencode-go", "minimax-m2.7");
+	assert.equal(model.api, "anthropic-messages");
+	const { pi, ctx } = createHarness();
+	Object.assign(ctx, { model });
+	await pi.emit("session_start", { reason: "start" }, ctx);
+	await pi.runCommand("opencode", "use 2", ctx);
+	let outgoing: unknown;
+	await streamAnthropic(model, history, {
+		// Test double: stops before the Anthropic client can be used, so no network call happens.
+		client: { messages: { create: () => { throw new Error("network must not be reached"); } } } as unknown as AnthropicOptions["client"],
+		cacheRetention: "none",
+		onPayload: async (payload) => {
+			outgoing = await pi.emit("before_provider_request", { payload }, ctx);
+			throw new Error("stop after real serialization");
+		},
+	}).result();
+	return outgoing;
+}
+
+test("real Anthropic serialization drops caller-bound reasoning before any network call", async () => {
+	await withTempConfig(async () => {
+		const model = getModel("opencode-go", "minimax-m2.7");
+		const history: Context = {
+			messages: [
+				{ role: "user", content: "Finish", timestamp: 0 },
+				{
+					role: "assistant", api: model.api, provider: model.provider, model: model.id,
+					stopReason: "toolUse", usage: zeroUsage, timestamp: 0,
+					content: [
+						{ type: "thinking", thinking: "Visible thought", thinkingSignature: "caller-bound-signature" },
+						{ type: "thinking", thinking: "", thinkingSignature: "caller-bound-ciphertext", redacted: true },
+						{ type: "text", text: "Visible answer" },
+						{ type: "toolCall", id: "done", name: "write", arguments: {} },
+					],
+				},
+				{ role: "toolResult", toolCallId: "done", toolName: "write", content: [{ type: "text", text: "Saved" }], isError: false, timestamp: 1 },
+			],
+		};
+		const original = structuredClone(history);
+
+		const outgoing = await serializeAnthropicTurn(history);
+
+		// The hook returns the replacement payload as `unknown`; this test inspects its concrete messages.
+		const serialized = outgoing as { messages: unknown[] };
+		assert.deepEqual(serialized.messages, [
+			{ role: "user", content: "Finish" },
+			{
+				role: "assistant",
+				content: [
+					{ type: "text", text: "Visible thought" },
+					{ type: "text", text: "Visible answer" },
+					{ type: "tool_use", id: "done", name: "write", input: {} },
+				],
+			},
+			{ role: "user", content: [{ type: "tool_result", tool_use_id: "done", content: "Saved", is_error: false }] },
+		]);
+		assert.deepEqual(history, original);
+	});
+});
+
+test("real Anthropic serialization omits an assistant turn emptied by the projection", async () => {
+	await withTempConfig(async () => {
+		const model = getModel("opencode-go", "minimax-m2.7");
+		const history: Context = {
+			messages: [
+				{ role: "user", content: "Go", timestamp: 0 },
+				{
+					role: "assistant", api: model.api, provider: model.provider, model: model.id,
+					stopReason: "stop", usage: zeroUsage, timestamp: 0,
+					content: [{ type: "thinking", thinking: "", thinkingSignature: "caller-bound-ciphertext", redacted: true }],
+				},
+				{
+					role: "assistant", api: model.api, provider: model.provider, model: model.id,
+					stopReason: "stop", usage: zeroUsage, timestamp: 1,
+					content: [{ type: "text", text: "Kept" }],
+				},
+			],
+		};
+		const original = structuredClone(history);
+
+		const outgoing = await serializeAnthropicTurn(history);
+
+		const serialized = outgoing as { messages: unknown[] };
+		assert.deepEqual(serialized.messages, [
+			{ role: "user", content: "Go" },
+			{ role: "assistant", content: [{ type: "text", text: "Kept" }] },
+		]);
+		assert.deepEqual(history, original);
+	});
+});
+
+// ---------------------------------------------------------------------------
+// Guarded quota recovery and late-continuation invalidation
+// ---------------------------------------------------------------------------
+
+const twoKeys = [{ name: "one", key: "sk-one" }, { name: "two", key: "sk-two" }];
+const fixedWindowError = "You have exceeded the 5-hour usage quota.";
+const transientError = "429 Too Many Requests";
+const assistantError = (errorMessage: string) => ({
+	message: { role: "assistant", provider: "opencode-go", stopReason: "error", errorMessage },
+});
+
+test("recovery clears a blocked key with confirmed headroom and rotates to it", async () => {
+	await withTempConfig(async (configPath) => {
+		patchConfig(configPath, { keys: twoKeys, quotaBlockedUntil: { 1: 9_999_999 } });
+		const { pi, ctx, state } = createHarness("authStorage", async () => activeUsage());
+
+		await pi.emit("session_start", { reason: "start" }, ctx);
+		await pi.emit("before_provider_request", {}, ctx);
+		await pi.emit("message_end", assistantError(transientError), ctx);
+
+		assert.equal(state.runtimeKeys.at(-1), "sk-two");
+		assert.deepEqual(readConfig(configPath).quotaBlockedUntil, {});
+		assert.match(state.notifications.join("\n"), /two has headroom again/);
+	});
+});
+
+test("late transient recovery cannot override a manual key selection", async () => {
+	await withTempConfig(async (configPath) => {
+		patchConfig(configPath, { keys: twoKeys, quotaBlockedUntil: { 1: 9_999_999 } });
+		const usage = deferred<Awaited<ReturnType<FetchApi>>>();
+		const { pi, ctx, state } = createHarness("authStorage", async () => usage.promise);
+
+		await pi.emit("session_start", { reason: "start" }, ctx);
+		await pi.emit("before_provider_request", {}, ctx);
+		const pending = pi.emit("message_end", assistantError(transientError), ctx);
+		await pi.runCommand("opencode", "use 1", ctx);
+		usage.resolve(activeUsage());
+		await pending;
+
+		assert.equal(readConfig(configPath).activeKeyIndex, 0);
+		assert.deepEqual(state.runtimeKeys, ["sk-one"]);
+	});
+});
+
+test("late after-response recovery cannot override a manual key selection", async () => {
+	await withTempConfig(async (configPath) => {
+		patchConfig(configPath, { keys: twoKeys, quotaBlockedUntil: { 1: 9_999_999 } });
+		const recovery = deferred<Awaited<ReturnType<FetchApi>>>();
+		let probeStarted: () => void = () => {};
+		const started = new Promise<void>((resolve) => { probeStarted = resolve; });
+		let calls = 0;
+		const { pi, ctx, state } = createHarness("authStorage", async () => {
+			calls++;
+			if (calls === 1) return activeUsage();
+			probeStarted();
+			return await recovery.promise;
+		});
+
+		await pi.emit("session_start", { reason: "start" }, ctx);
+		await pi.emit("before_provider_request", {}, ctx);
+		const pending = pi.emit("after_provider_response", { status: 429 }, ctx);
+		await started;
+		await pi.runCommand("opencode", "use 1", ctx);
+		recovery.resolve(activeUsage());
+		await pending;
+
+		assert.equal(readConfig(configPath).activeKeyIndex, 0);
+		assert.deepEqual(state.runtimeKeys, ["sk-one"]);
+	});
+});
+
+test("late recovery cannot quota-block a replacement for a removed failed key", async () => {
+	await withTempConfig(async (configPath) => {
+		patchConfig(configPath, { keys: twoKeys, activeKeyIndex: 1, quotaBlockedUntil: { 0: 9_999_999 } });
+		const usage = deferred<Awaited<ReturnType<FetchApi>>>();
+		const { pi, ctx } = createHarness("authStorage", async () => usage.promise);
+
+		await pi.emit("session_start", { reason: "start" }, ctx);
+		await pi.emit("before_provider_request", {}, ctx);
+		const pending = pi.emit("message_end", assistantError(fixedWindowError), ctx);
+		await pi.runCommand("opencode", "rm 2", ctx);
+		await pi.runCommand("opencode", "add replacement synthetic-replacement", ctx);
+		usage.resolve(activeUsage());
+		await pending;
+
+		const config = readConfig(configPath);
+		assert.equal(config.keys[1].key, "synthetic-replacement");
+		assert.equal(config.quotaBlockedUntil?.["1"], undefined);
+	});
+});
+
+test("stale after-response bookkeeping cannot suppress the next request rotation", async () => {
+	await withTempConfig(async (configPath) => {
+		patchConfig(configPath, { keys: twoKeys, quotaBlockedUntil: { 1: 9_999_999 } });
+		const recovery = deferred<Awaited<ReturnType<FetchApi>>>();
+		let probeStarted: () => void = () => {};
+		const started = new Promise<void>((resolve) => { probeStarted = resolve; });
+		let calls = 0;
+		const { pi, ctx, state } = createHarness("authStorage", async () => {
+			calls++;
+			if (calls === 1) return activeUsage();
+			probeStarted();
+			return await recovery.promise;
+		});
+
+		await pi.emit("session_start", { reason: "start" }, ctx);
+		await pi.emit("before_provider_request", {}, ctx);
+		const pending = pi.emit("after_provider_response", { status: 429 }, ctx);
+		await started;
+		await pi.emit("before_provider_request", {}, ctx);
+		recovery.resolve(activeUsage());
+		await pending;
+
+		assert.equal(state.runtimeKeys.at(-1), "sk-one", "a superseded response must not rotate or mark itself handled");
+		await pi.emit("message_end", assistantError(transientError), ctx);
+		assert.equal(state.runtimeKeys.at(-1), "sk-two");
+		assert.match(state.notifications.join("\n"), /Rate-limited → rotated to two/);
+	});
+});
+
+test("a stale startup recovery cannot override a manual key selection", async () => {
+	await withTempConfig(async (configPath) => {
+		patchConfig(configPath, { quotaBlockedUntil: { 0: 9_999_999 } });
+		const usage = deferred<Awaited<ReturnType<FetchApi>>>();
+		const { pi, ctx } = createHarness("authStorage", async () => usage.promise);
+
+		const startup = pi.emit("session_start", { reason: "start" }, ctx);
+		await pi.runCommand("opencode", "use 3", ctx);
+		usage.resolve(activeUsage());
+		await startup;
+
+		assert.equal(readConfig(configPath).activeKeyIndex, 2);
+		assert.equal(readConfig(configPath).quotaBlockedUntil?.["0"], 9_999_999);
+	});
+});
+
+const snapshotMutations = [
+	{ name: "quota deadline", mutate: (config: Config) => { config.quotaBlockedUntil[0] = 19_999_999; } },
+	{ name: "cooldown", mutate: (config: Config) => { config.cooldowns[0] = 500_000; } },
+	{ name: "active selection", mutate: (config: Config) => { config.activeKeyIndex = 1; } },
+	{ name: "credential", mutate: (config: Config) => { config.keys[0].key = "sk-replaced"; } },
+] satisfies Array<{ name: string; mutate: (config: Config) => void }>;
+
+for (const { name, mutate } of snapshotMutations) {
+	test(`a changed shared ${name} cancels pending startup recovery`, async () => {
+		await withTempConfig(async (configPath) => {
+			patchConfig(configPath, { quotaBlockedUntil: { 0: 9_999_999 } });
+			const usage = deferred<Awaited<ReturnType<FetchApi>>>();
+			const { pi, ctx } = createHarness("authStorage", async () => usage.promise);
+
+			const startup = pi.emit("session_start", { reason: "start" }, ctx);
+			updateConfig((config) => mutate(config));
+			const afterMutation = readConfig(configPath);
+			usage.resolve(activeUsage());
+			await startup;
+
+			assert.deepEqual(readConfig(configPath), afterMutation);
+		});
+	});
+}
+
+for (const { name, response, cleared } of [
+	{ name: "an empty window list", response: usageResponse([]), cleared: false },
+	{ name: "mixed active and unknown windows", response: usageResponse([{ name: "rolling", status: "active" }, { name: "monthly", status: "unknown" }]), cleared: false },
+	{ name: "a rate-limited window", response: usageResponse([{ status: "rate-limited" }]), cleared: false },
+	{ name: "a malformed usage body", response: { ok: true, status: 200, json: async () => ({ windows: [42] }) }, cleared: false },
+	{ name: "a failed usage request", response: { ok: false, status: 503, json: async () => ({}) }, cleared: false },
+	{ name: "all windows active", response: usageResponse([{ name: "rolling", status: "active" }, { name: "weekly", status: "active" }]), cleared: true },
+]) {
+	test(`startup recovery treats ${name} as ${cleared ? "confirmed headroom" : "uncertain"}`, async () => {
+		await withTempConfig(async (configPath) => {
+			patchConfig(configPath, { quotaBlockedUntil: { 0: 9_999_999 } });
+			const { pi, ctx, state } = createHarness("authStorage", async () => response);
+
+			await pi.emit("session_start", { reason: "start" }, ctx);
+
+			assert.equal(readConfig(configPath).quotaBlockedUntil?.["0"], cleared ? undefined : 9_999_999);
+			// Recovery never replaces the startup fallback: an uncertain reading leaves the
+			// healthy key active rather than leaving the session with no key.
+			assert.equal(state.runtimeKeys.at(-1), cleared ? "sk-one" : "sk-two");
+		});
+	});
+}
+
+test("a late headroom snapshot cannot erase a newer shared-session quota block", async () => {
+	await withTempConfig(async (configPath) => {
+		patchConfig(configPath, { quotaBlockedUntil: { 0: 9_999_999 } });
+		const usage = deferred<Awaited<ReturnType<FetchApi>>>();
+		const { pi, ctx } = createHarness("authStorage", async () => usage.promise);
+
+		const startup = pi.emit("session_start", { reason: "start" }, ctx);
+		updateConfig((config) => { config.quotaBlockedUntil[0] = 19_999_999; });
+		usage.resolve(activeUsage());
+		await startup;
+
+		assert.equal(readConfig(configPath).quotaBlockedUntil?.["0"], 19_999_999);
+	});
+});
+
+test("a superseded response cannot rotate or finalize after a newer request starts", async () => {
+	await withTempConfig(async () => {
+		const fetch: FetchApi = async () => ({ ok: false, status: 404, json: async () => ({}) });
+		const { pi, ctx, state } = createHarness("authStorage", fetch);
+
+		await pi.emit("session_start", { reason: "start" }, ctx);
+		await pi.emit("before_provider_request", {}, ctx);
+		const pending = pi.emit("after_provider_response", { status: 429 }, ctx);
+		await pi.emit("before_provider_request", {}, ctx);
+		await pending;
+
+		assert.doesNotMatch(state.notifications.join("\n"), /Proactive rate-limit detection/);
+		await pi.emit("message_end", assistantError(transientError), ctx);
+		assert.equal(state.runtimeKeys.at(-1), "sk-two", "the newer request must still rotate exactly once");
+	});
+});
+
+test("a fast-path message_end rotation cannot notify after a newer request starts", async () => {
+	await withTempConfig(async () => {
+		const { pi, ctx, state } = createHarness();
+
+		await pi.emit("session_start", { reason: "start" }, ctx);
+		await pi.emit("before_provider_request", {}, ctx);
+		const pending = pi.emit("message_end", assistantError(transientError), ctx);
+		await pi.emit("before_provider_request", {}, ctx);
+		await pending;
+
+		assert.doesNotMatch(state.notifications.join("\n"), /rotated to two/, "a superseded message_end must not report its old rotation");
+	});
+});
+
+test("a stale uncertain recovery cannot report exhaustion for a superseded decision", async () => {
+	await withTempConfig(async (configPath) => {
+		patchConfig(configPath, { keys: twoKeys, quotaBlockedUntil: { 1: 9_999_999 } });
+		const usage = deferred<Awaited<ReturnType<FetchApi>>>();
+		const { pi, ctx, state } = createHarness("authStorage", async () => usage.promise);
+
+		await pi.emit("session_start", { reason: "start" }, ctx);
+		await pi.emit("before_provider_request", {}, ctx);
+		const pending = pi.emit("message_end", assistantError(transientError), ctx);
+		await pi.runCommand("opencode", "use 1", ctx);
+		usage.resolve(usageResponse([]));
+		await pending;
+
+		assert.doesNotMatch(state.notifications.join("\n"), /all other keys are quota-blocked/);
 	});
 });

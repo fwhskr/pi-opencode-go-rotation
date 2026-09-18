@@ -175,42 +175,87 @@ function rotateToNextKey(config, options = {}) {
 // provenance (including after reload). Never replay signed reasoning on this
 // rotating route, even before this process observes its first rotation.
 const droppedReasoningDetail = Symbol("dropped-caller-bound-reasoning");
+function projectReasoningDetails(details) {
+    // map/filter, never flatMap: entries that are not plain reasoning detail
+    // objects (nested arrays, numbers, booleans, ...) must pass through as the
+    // same element in the same position, with their original shape intact.
+    return details
+        .map((detail) => {
+        if (!isRecord(detail))
+            return detail;
+        if (detail.type === "reasoning.encrypted")
+            return droppedReasoningDetail;
+        const { signature: _signature, ...unsigned } = detail;
+        return unsigned;
+    })
+        .filter((detail) => detail !== droppedReasoningDetail);
+}
+/**
+ * Anthropic serializes signed thinking as `thinking` blocks and opaque redacted
+ * reasoning as `redacted_thinking`. Emit the SDK's own unsigned shape instead: a
+ * plain text block. Drop entries emptied by that projection, and report an
+ * assistant message for omission only when the projection emptied it.
+ */
+function projectAssistantContent(content) {
+    let projected = false;
+    const result = [];
+    for (const block of content) {
+        if (!isRecord(block)) {
+            result.push(block);
+            continue;
+        }
+        if (block.type === "thinking") {
+            projected = true;
+            const thinking = typeof block.thinking === "string" ? block.thinking : "";
+            if (block.redacted !== true && thinking.trim().length > 0)
+                result.push({ type: "text", text: thinking });
+            continue;
+        }
+        if (block.type === "redacted_thinking") {
+            projected = true;
+            continue;
+        }
+        result.push(block);
+    }
+    if (!projected)
+        return content;
+    return result.length === 0 ? undefined : result;
+}
 function sanitizeReasoningPayload(payload) {
-    if (!payload || typeof payload !== "object" || Array.isArray(payload))
+    if (!isRecord(payload))
         return payload;
-    const request = payload;
-    const result = { ...request };
+    const request = { ...payload };
     if (Array.isArray(request.messages)) {
-        result.messages = request.messages.map((message) => {
-            if (!message || typeof message !== "object")
-                return message;
-            const entry = message;
-            if (entry.role !== "assistant" || !Array.isArray(entry.reasoning_details))
-                return message;
-            // map/filter, never flatMap: entries that are not plain reasoning detail
-            // objects (nested arrays, numbers, booleans, ...) must pass through as the
-            // same element in the same position, with their original shape intact.
-            const projected = entry.reasoning_details.map((detail) => {
-                if (!detail || typeof detail !== "object" || Array.isArray(detail))
-                    return detail;
-                const item = detail;
-                if (item.type === "reasoning.encrypted")
-                    return droppedReasoningDetail;
-                const { signature: _signature, ...unsigned } = item;
-                return unsigned;
-            });
-            const reasoning_details = projected.filter((detail) => detail !== droppedReasoningDetail);
-            const { reasoning_details: _details, ...visible } = entry;
-            // Strip the key entirely when nothing remains to send: an empty array is an
-            // unvalidated request shape, and this sanitiser exists to emit only shapes the
-            // provider accepts. Non-detail entries above keep identity/position/shape.
-            return reasoning_details.length === 0 ? visible : { ...visible, reasoning_details };
-        });
+        const messages = [];
+        for (const message of request.messages) {
+            if (!isRecord(message) || message.role !== "assistant") {
+                messages.push(message);
+                continue;
+            }
+            let projected = message;
+            if (Array.isArray(message.content)) {
+                const content = projectAssistantContent(message.content);
+                if (content === undefined)
+                    continue;
+                if (content !== message.content)
+                    projected = { ...projected, content };
+            }
+            if (Array.isArray(message.reasoning_details)) {
+                const { reasoning_details: _details, ...visible } = projected;
+                const reasoning_details = projectReasoningDetails(message.reasoning_details);
+                // Strip the key entirely when nothing remains to send: an empty array is an
+                // unvalidated request shape, and this sanitiser exists to emit only shapes the
+                // provider accepts. Non-detail entries above keep identity/position/shape.
+                projected = reasoning_details.length === 0 ? visible : { ...visible, reasoning_details };
+            }
+            messages.push(projected);
+        }
+        request.messages = messages;
     }
     if (Array.isArray(request.input)) {
-        result.input = request.input.filter((item) => !item || typeof item !== "object" || item.type !== "reasoning");
+        request.input = request.input.filter((item) => !isRecord(item) || item.type !== "reasoning");
     }
-    return result;
+    return request;
 }
 const lastAppliedRuntimeKeys = new WeakMap();
 function getRuntimeKeyStore(modelRegistry) {
@@ -248,6 +293,42 @@ function getUsageTargetForKeyIndex(config, keyIndex) {
 }
 function getActiveUsageTarget(config) {
     return getUsageTargetForKeyIndex(config, config.activeKeyIndex);
+}
+function captureSelectionSnapshot(config, currentTime, keyIndex) {
+    const target = getUsageTargetForKeyIndex(config, keyIndex);
+    if (!target)
+        return undefined;
+    return {
+        ...target,
+        blockedUntil: getQuotaBlockedUntil(config, target.keyIndex, currentTime),
+        cooldownStart: config.cooldowns[target.keyIndex],
+    };
+}
+/**
+ * A deferred decision owns one credential, selection, block and cooldown. Every later
+ * mutation re-checks that exact snapshot under the lock, so an operation that started
+ * before an external update can never write to the replacement state.
+ */
+function matchesSelectionSnapshot(config, snapshot, currentTime) {
+    const entry = config.keys[snapshot.keyIndex];
+    if (entry === undefined)
+        return false;
+    if ((entry.name || `key-${snapshot.keyIndex + 1}`) !== snapshot.keyName)
+        return false;
+    if (entry.key !== snapshot.bearerToken)
+        return false;
+    if (getQuotaBlockedUntil(config, snapshot.keyIndex, currentTime) !== snapshot.blockedUntil)
+        return false;
+    return config.cooldowns[snapshot.keyIndex] === snapshot.cooldownStart;
+}
+function captureRotationOperation(config, currentTime, keyIndex, epoch) {
+    const selection = captureSelectionSnapshot(config, currentTime, keyIndex);
+    return selection ? { epoch, currentTime, selection } : undefined;
+}
+function isRotationOperationCurrent(operation, config, epoch) {
+    return epoch === operation.epoch
+        && config.activeKeyIndex === operation.selection.keyIndex
+        && matchesSelectionSnapshot(config, operation.selection, operation.currentTime);
 }
 function isRecord(value) {
     return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -373,15 +454,13 @@ function captureUsageDecision(config, epoch) {
     return target ? { epoch, target } : undefined;
 }
 function isValidUsageDecisionTarget(decision, config, epoch) {
-    const entry = config.keys[decision.target.keyIndex];
-    return epoch === decision.epoch
-        && entry !== undefined
-        && (entry.name || `key-${decision.target.keyIndex + 1}`) === decision.target.keyName
-        && entry.key === decision.target.bearerToken;
+    return epoch === decision.epoch && matchesUsageTarget(config, decision.target);
 }
-function isCurrentUsageDecision(decision, config, epoch) {
-    return config.activeKeyIndex === decision.target.keyIndex
-        && isValidUsageDecisionTarget(decision, config, epoch);
+function matchesUsageTarget(config, target) {
+    const entry = config.keys[target.keyIndex];
+    return entry !== undefined
+        && (entry.name || `key-${target.keyIndex + 1}`) === target.keyName
+        && entry.key === target.bearerToken;
 }
 function hasRateLimitedUsageWindow(result) {
     return result.ok && result.usage.windows.some((window) => window.status === "rate-limited");
@@ -389,12 +468,13 @@ function hasRateLimitedUsageWindow(result) {
 /**
  * A recorded block can go stale: the plan was topped up, or the window reset before the
  * deadline we stored. Only a clean reading releases it -- a failed or unrecognised usage
- * response is not evidence of headroom.
+ * response is not evidence of headroom. A response with no windows, or with any window
+ * that is not positively active, stays conservative and keeps the recorded block.
  */
 function hasConfirmedHeadroom(result) {
     return result.ok
-        && result.usage.windows.some((window) => window.status === "active")
-        && !hasRateLimitedUsageWindow(result);
+        && result.usage.windows.length > 0
+        && result.usage.windows.every((window) => window.status === "active");
 }
 function getRateLimitedUntil(usage, now, fallbackMs) {
     let blockedUntil = now;
@@ -654,73 +734,152 @@ export function createOpencodeGoRotationExtension(options = {}) {
                 responseHandled: true,
             };
         }
+        function currentRotationOperation(currentTime) {
+            return captureRotationOperation(config, currentTime, config.activeKeyIndex, usageDecisionEpoch);
+        }
+        /** Post-await effects are allowed only while the completed decision still owns the state. */
+        function isCompletionCurrent(outcome) {
+            return (outcome.kind === "rotated" || outcome.kind === "none")
+                && refreshConfig()
+                && isRotationOperationCurrent(outcome.completion, config, usageDecisionEpoch);
+        }
         /**
-         * A benched key can become usable again after we recorded its block. Before concluding
-         * that every key is exhausted, re-check the blocked keys and release the ones the usage
-         * endpoint no longer reports as rate-limited.
+         * A benched key can become usable again after we recorded its block. Probe the blocked
+         * keys without mutating anything; only a positive reading is collected as candidate
+         * headroom. The probes are data-only, so a stale result can never be applied without the
+         * guarded commit re-checking the credential, block and cooldown it was sampled from.
          */
-        async function releaseRecoveredQuotaBlocks(ctx, currentTime, skipKeyIndex) {
-            const targets = getQuotaBlockedTargets(config, currentTime, skipKeyIndex);
-            let released = false;
-            for (const target of targets) {
-                const usage = await fetchOpenCodeGoUsage(target, fetchApi, options.timers);
+        async function probeRecoveredHeadroom(currentTime, skipKeyIndex) {
+            if (!refreshConfig())
+                return [];
+            const candidates = getQuotaBlockedTargets(config, currentTime, skipKeyIndex)
+                .map((target) => captureSelectionSnapshot(config, currentTime, target.keyIndex))
+                .filter((snapshot) => snapshot !== undefined);
+            const recovered = [];
+            for (const candidate of candidates) {
+                const usage = await fetchOpenCodeGoUsage(candidate, fetchApi, options.timers);
+                if (hasConfirmedHeadroom(usage))
+                    recovered.push(candidate);
+                // Keep the in-memory config aligned with writers active during the probes.
                 if (!refreshConfig())
-                    return released;
-                if (!hasConfirmedHeadroom(usage))
-                    continue;
-                const cleared = mutateSharedConfig((freshConfig) => {
-                    const entry = freshConfig.keys[target.keyIndex];
-                    if (!entry || entry.key !== target.bearerToken)
-                        return false;
-                    if (getQuotaBlockedUntil(freshConfig, target.keyIndex, currentTime) === undefined)
-                        return false;
-                    delete freshConfig.quotaBlockedUntil[target.keyIndex];
-                    delete freshConfig.cooldowns[target.keyIndex];
-                    return true;
-                });
-                if (cleared !== true)
-                    continue;
-                released = true;
-                ctx.ui.notify(`OpenCode: ${target.keyName} has headroom again → quota block cleared`, "info");
+                    break;
             }
-            return released;
+            return recovered;
+        }
+        function selectNextKey(mode, freshConfig, startIndex, currentTime) {
+            return mode.kind === "quota"
+                ? blockQuotaAndSelectNext(freshConfig, startIndex, mode.blockedUntil, currentTime, mode.authoritative)
+                : rotateToNextKey(freshConfig, { now: currentTime });
         }
         /**
-         * Rotate to a different key, re-verifying benched keys first. `undefined` means no
-         * rotation happened, so the caller must not report one.
+         * Block the failed key and select a replacement, re-probing benched keys only when the
+         * fast path found nothing. Every mutation re-validates the operation snapshot under the
+         * lock, so a decision invalidated while probes were in flight is cancelled instead of
+         * being rebased onto the newer state.
          */
-        async function rotateAfterRevalidation(ctx, currentTime) {
-            const previousIndex = config.activeKeyIndex;
-            let nextIndex = mutateSharedConfig((freshConfig) => rotateToNextKey(freshConfig, { now: currentTime }));
-            if (nextIndex === undefined || nextIndex === previousIndex) {
-                if (await releaseRecoveredQuotaBlocks(ctx, currentTime, previousIndex)) {
-                    nextIndex = mutateSharedConfig((freshConfig) => rotateToNextKey(freshConfig, { now: currentTime }));
+        async function rotateWithRecovery(ctx, operation, currentTime, mode) {
+            const startIndex = operation.selection.keyIndex;
+            const fast = mutateSharedConfig((freshConfig) => {
+                if (!isRotationOperationCurrent(operation, freshConfig, usageDecisionEpoch)) {
+                    return { outcome: "cancelled" };
                 }
+                return { outcome: "done", value: selectNextKey(mode, freshConfig, startIndex, currentTime) };
+            });
+            if (fast === undefined)
+                return { kind: "unavailable" };
+            if (fast.outcome === "cancelled")
+                return { kind: "cancelled" };
+            if (fast.value !== undefined && fast.value !== startIndex) {
+                const completion = currentRotationOperation(currentTime);
+                return completion ? { kind: "rotated", keyIndex: fast.value, completion } : { kind: "cancelled" };
             }
-            return nextIndex === previousIndex ? undefined : nextIndex;
+            // Snapshot the state this operation just produced, so a later commit can detect any
+            // external change to the same credential, block, cooldown or selection.
+            const retryOperation = currentRotationOperation(currentTime);
+            const failedKey = captureSelectionSnapshot(config, currentTime, startIndex);
+            if (!retryOperation || !failedKey)
+                return { kind: "cancelled" };
+            const recovered = await probeRecoveredHeadroom(currentTime, startIndex);
+            if (configError)
+                return { kind: "unavailable" };
+            if (usageDecisionEpoch !== operation.epoch)
+                return { kind: "cancelled" };
+            if (recovered.length === 0) {
+                // Still verify the state this operation owns: a shared writer may have moved the
+                // selection, credential, block or cooldown while the probes were in flight.
+                const current = matchesSelectionSnapshot(config, failedKey, currentTime)
+                    && isRotationOperationCurrent(retryOperation, config, usageDecisionEpoch);
+                return current ? { kind: "none", completion: retryOperation } : { kind: "cancelled" };
+            }
+            const commit = mutateSharedConfig((freshConfig) => {
+                if (!isRotationOperationCurrent(retryOperation, freshConfig, usageDecisionEpoch))
+                    return { outcome: "cancelled" };
+                if (!matchesSelectionSnapshot(freshConfig, failedKey, currentTime))
+                    return { outcome: "cancelled" };
+                if (!recovered.every((snapshot) => matchesSelectionSnapshot(freshConfig, snapshot, currentTime)))
+                    return { outcome: "cancelled" };
+                for (const snapshot of recovered) {
+                    delete freshConfig.quotaBlockedUntil[snapshot.keyIndex];
+                    delete freshConfig.cooldowns[snapshot.keyIndex];
+                }
+                return { outcome: "done", value: selectNextKey(mode, freshConfig, startIndex, currentTime) };
+            });
+            if (commit === undefined)
+                return { kind: "unavailable" };
+            if (commit.outcome === "cancelled")
+                return { kind: "cancelled" };
+            for (const snapshot of recovered) {
+                ctx.ui.notify(`OpenCode: ${snapshot.keyName} has headroom again → quota block cleared`, "info");
+            }
+            const completion = currentRotationOperation(currentTime);
+            if (!completion)
+                return { kind: "cancelled" };
+            const selected = commit.value;
+            return selected === undefined || selected === startIndex
+                ? { kind: "none", completion }
+                : { kind: "rotated", keyIndex: selected, completion };
         }
-        async function rotateForQuotaExhaustion(ctx, keyIndex, blockedUntil, currentTime, isAuthoritative = false) {
-            const exhaustedName = config.keys[keyIndex]?.name || `key-${keyIndex + 1}`;
-            let nextIndex = mutateSharedConfig((freshConfig) => blockQuotaAndSelectNext(freshConfig, keyIndex, blockedUntil, currentTime, isAuthoritative));
-            if (nextIndex === undefined && (await releaseRecoveredQuotaBlocks(ctx, currentTime, keyIndex))) {
-                nextIndex = mutateSharedConfig((freshConfig) => blockQuotaAndSelectNext(freshConfig, keyIndex, blockedUntil, currentTime, isAuthoritative));
+        /** Guarded startup/reload recovery: clears only blocks whose snapshot is still current. */
+        async function recoverQuotaBlocksGuarded(ctx, operation, currentTime) {
+            const recovered = await probeRecoveredHeadroom(currentTime);
+            if (configError)
+                return "unavailable";
+            if (usageDecisionEpoch !== operation.epoch)
+                return "cancelled";
+            if (recovered.length === 0) {
+                return isRotationOperationCurrent(operation, config, usageDecisionEpoch) ? "none" : "cancelled";
             }
-            if (nextIndex === undefined) {
-                if (configError) {
-                    ctx.ui.notify(`OpenCode: ${configError}. Automatic rotation was skipped.`, "error");
-                    return;
+            const commit = mutateSharedConfig((freshConfig) => {
+                if (!isRotationOperationCurrent(operation, freshConfig, usageDecisionEpoch))
+                    return { outcome: "cancelled" };
+                if (!recovered.every((snapshot) => matchesSelectionSnapshot(freshConfig, snapshot, currentTime)))
+                    return { outcome: "cancelled" };
+                for (const snapshot of recovered) {
+                    delete freshConfig.quotaBlockedUntil[snapshot.keyIndex];
+                    delete freshConfig.cooldowns[snapshot.keyIndex];
                 }
-                invalidateAutomaticDecisions();
-                const earliestReset = getEarliestQuotaReset(config, currentTime);
-                const reset = earliestReset === undefined
-                    ? "an unknown reset time"
-                    : formatResetIn(Math.ceil((earliestReset - currentTime) / 1000));
-                ctx.ui.notify(`OpenCode: ${exhaustedName} reached its plan quota; all configured keys are quota-blocked. Earliest reset in ${reset}.`, "warning");
+                return { outcome: "done", value: true };
+            });
+            if (commit === undefined)
+                return "unavailable";
+            if (commit.outcome === "cancelled")
+                return "cancelled";
+            for (const snapshot of recovered) {
+                ctx.ui.notify(`OpenCode: ${snapshot.keyName} has headroom again → quota block cleared`, "info");
+            }
+            return "recovered";
+        }
+        function reportQuotaExhausted(ctx, exhaustedName, currentTime) {
+            if (configError) {
+                ctx.ui.notify(`OpenCode: ${configError}. Automatic rotation was skipped.`, "error");
                 return;
             }
             invalidateAutomaticDecisions();
-            const keyName = applyActiveKey(config, ctx.modelRegistry, currentTime) ?? `key-${nextIndex + 1}`;
-            ctx.ui.notify(`OpenCode: ${exhaustedName} reached its plan quota → rotated to ${keyName}`, "info");
+            const earliestReset = getEarliestQuotaReset(config, currentTime);
+            const reset = earliestReset === undefined
+                ? "an unknown reset time"
+                : formatResetIn(Math.ceil((earliestReset - currentTime) / 1000));
+            ctx.ui.notify(`OpenCode: ${exhaustedName} reached its plan quota; all configured keys are quota-blocked. Earliest reset in ${reset}.`, "warning");
         }
         function stopWatchdog() {
             const timeoutInfo = watchdog?.consumeTimeoutInfo();
@@ -827,9 +986,21 @@ export function createOpencodeGoRotationExtension(options = {}) {
             // session uses, rather than benching a key that is usable again -- or leaving every key
             // held by a block with nothing left to rotate to.
             if (config.keys.length > 0) {
-                const activeBlocked = getQuotaBlockedUntil(config, config.activeKeyIndex, now()) !== undefined;
-                if (activeBlocked || pickAvailableKeyIndex(config, now()) === undefined) {
-                    await releaseRecoveredQuotaBlocks(ctx, now());
+                const currentTime = now();
+                const activeBlocked = getQuotaBlockedUntil(config, config.activeKeyIndex, currentTime) !== undefined;
+                if (activeBlocked || pickAvailableKeyIndex(config, currentTime) === undefined) {
+                    const operation = currentRotationOperation(currentTime);
+                    if (!operation)
+                        return;
+                    const recovery = await recoverQuotaBlocksGuarded(ctx, operation, currentTime);
+                    // A startup continuation invalidated while probes were in flight must not
+                    // clear blocks or re-apply a key on top of the newer decision.
+                    if (recovery === "cancelled")
+                        return;
+                    if (usageDecisionEpoch !== operation.epoch)
+                        return;
+                    if (!refreshConfig())
+                        return;
                 }
             }
             // On reload: re-apply active key, skip auto-import
@@ -911,8 +1082,14 @@ export function createOpencodeGoRotationExtension(options = {}) {
                 const currentTime = now();
                 const authoritativeReset = parseFixedWindowQuotaReset(message.errorMessage ?? "", currentTime);
                 const blockedUntil = authoritativeReset ?? currentTime + getCooldownMs(config);
+                const exhaustedName = config.keys[requestState.decision.target.keyIndex]?.name
+                    || `key-${requestState.decision.target.keyIndex + 1}`;
                 if (requestState.responseHandled) {
                     const persisted = mutateSharedConfig((freshConfig) => {
+                        // The handled response may upgrade the reset of its own credential, but never
+                        // of whatever credential now occupies that index.
+                        if (!matchesUsageTarget(freshConfig, requestState.decision.target))
+                            return false;
                         if (authoritativeReset === undefined) {
                             setQuotaBlock(freshConfig, requestState.decision.target.keyIndex, blockedUntil, currentTime);
                         }
@@ -926,7 +1103,31 @@ export function createOpencodeGoRotationExtension(options = {}) {
                     invalidateAutomaticDecisions();
                     return;
                 }
-                await rotateForQuotaExhaustion(ctx, requestState.decision.target.keyIndex, blockedUntil, currentTime, authoritativeReset !== undefined);
+                const operation = currentRotationOperation(currentTime);
+                if (!operation || operation.selection.keyIndex !== requestState.decision.target.keyIndex)
+                    return;
+                const outcome = await rotateWithRecovery(ctx, operation, currentTime, {
+                    kind: "quota",
+                    blockedUntil,
+                    authoritative: authoritativeReset !== undefined,
+                });
+                if (outcome.kind === "cancelled")
+                    return;
+                if (outcome.kind === "unavailable") {
+                    if (usageDecisionEpoch !== operation.epoch)
+                        return;
+                    reportQuotaExhausted(ctx, exhaustedName, currentTime);
+                    return;
+                }
+                if (!isCompletionCurrent(outcome))
+                    return;
+                if (outcome.kind === "none") {
+                    reportQuotaExhausted(ctx, exhaustedName, currentTime);
+                    return;
+                }
+                invalidateAutomaticDecisions();
+                const keyName = applyActiveKey(config, ctx.modelRegistry, currentTime) ?? `key-${outcome.keyIndex + 1}`;
+                ctx.ui.notify(`OpenCode: ${exhaustedName} reached its plan quota → rotated to ${keyName}`, "info");
                 return;
             }
             if (requestState.responseHandled) {
@@ -939,19 +1140,29 @@ export function createOpencodeGoRotationExtension(options = {}) {
                 return;
             }
             const currentTime = now();
-            const newIndex = await rotateAfterRevalidation(ctx, currentTime);
-            if (newIndex === undefined) {
-                if (configError)
-                    ctx.ui.notify(`OpenCode: ${configError}. Automatic rotation was skipped.`, "error");
-                else {
-                    invalidateAutomaticDecisions();
-                    ctx.ui.notify("OpenCode: Rate limited; all other keys are quota-blocked.", "warning");
-                }
+            const operation = currentRotationOperation(currentTime);
+            if (!operation || operation.selection.keyIndex !== requestState.decision.target.keyIndex)
+                return;
+            const outcome = await rotateWithRecovery(ctx, operation, currentTime, { kind: "cooldown" });
+            if (outcome.kind === "cancelled")
+                return;
+            if (outcome.kind === "unavailable") {
+                if (usageDecisionEpoch !== operation.epoch)
+                    return;
+                ctx.ui.notify(`OpenCode: ${configError}. Automatic rotation was skipped.`, "error");
+                return;
+            }
+            // Never finalize a decision that lost ownership while the rotation was in flight.
+            if (!isCompletionCurrent(outcome))
+                return;
+            if (outcome.kind === "none") {
+                invalidateAutomaticDecisions();
+                ctx.ui.notify("OpenCode: Rate limited; all other keys are quota-blocked.", "warning");
                 return;
             }
             invalidateAutomaticDecisions();
             const keyName = applyActiveKey(config, ctx.modelRegistry, currentTime);
-            ctx.ui.notify(`OpenCode: Rate-limited → rotated to ${keyName ?? `key-${newIndex + 1}`}`, "info");
+            ctx.ui.notify(`OpenCode: Rate-limited → rotated to ${keyName ?? `key-${outcome.keyIndex + 1}`}`, "info");
         });
         pi.on("after_provider_response", async (event, ctx) => {
             if (ctx.model?.provider !== PROVIDER)
@@ -963,46 +1174,93 @@ export function createOpencodeGoRotationExtension(options = {}) {
                 return;
             if (!refreshConfig())
                 return;
-            const decision = getCurrentRequestRateLimitState()?.decision;
-            if (!decision)
+            const requestState = getCurrentRequestRateLimitState();
+            if (!requestState)
                 return;
+            const decision = requestState.decision;
+            const operation = currentRotationOperation(now());
+            if (!operation || operation.selection.keyIndex !== decision.target.keyIndex)
+                return;
+            // Bookkeeping for this response is allowed only while it still owns the request state.
+            const markHandledIfOwned = () => {
+                if (requestRateLimitState === requestState)
+                    markResponseRateLimitHandled(decision);
+            };
             if (event.status === 401)
                 requestRateLimitState = undefined;
             const usage = await fetchOpenCodeGoUsage(decision.target, fetchApi, options.timers);
             if (!refreshConfig())
                 return;
-            if (!isCurrentUsageDecision(decision, config, usageDecisionEpoch))
+            if (!isRotationOperationCurrent(operation, config, usageDecisionEpoch))
                 return;
+            const currentTime = now();
+            const exhaustedName = config.keys[decision.target.keyIndex]?.name || `key-${decision.target.keyIndex + 1}`;
             if (usage.ok && hasRateLimitedUsageWindow(usage)) {
-                const currentTime = now();
-                await rotateForQuotaExhaustion(ctx, decision.target.keyIndex, getRateLimitedUntil(usage.usage, currentTime, getCooldownMs(config)), currentTime);
+                const outcome = await rotateWithRecovery(ctx, operation, currentTime, {
+                    kind: "quota",
+                    blockedUntil: getRateLimitedUntil(usage.usage, currentTime, getCooldownMs(config)),
+                    authoritative: false,
+                });
+                if (outcome.kind === "cancelled")
+                    return;
+                if (outcome.kind === "unavailable") {
+                    if (usageDecisionEpoch !== operation.epoch)
+                        return;
+                    reportQuotaExhausted(ctx, exhaustedName, currentTime);
+                }
+                else if (!isCompletionCurrent(outcome)) {
+                    return;
+                }
+                else if (outcome.kind === "rotated") {
+                    invalidateAutomaticDecisions();
+                    const keyName = applyActiveKey(config, ctx.modelRegistry, currentTime) ?? `key-${outcome.keyIndex + 1}`;
+                    ctx.ui.notify(`OpenCode: ${exhaustedName} reached its plan quota → rotated to ${keyName}`, "info");
+                }
+                else {
+                    reportQuotaExhausted(ctx, exhaustedName, currentTime);
+                }
                 if (event.status === 429)
-                    markResponseRateLimitHandled(decision);
+                    markHandledIfOwned();
                 ctx.ui.notify(formatUsageStatus(usage), "warning");
                 return;
             }
             if (event.status === 401)
                 return;
             if (config.keys.length <= 1) {
-                markResponseRateLimitHandled(decision);
+                markHandledIfOwned();
                 return;
             }
-            const currentTime = now();
-            const newIndex = await rotateAfterRevalidation(ctx, currentTime);
-            if (newIndex === undefined) {
+            const outcome = await rotateWithRecovery(ctx, operation, currentTime, { kind: "cooldown" });
+            if (outcome.kind === "cancelled")
+                return;
+            if (outcome.kind === "unavailable") {
+                if (usageDecisionEpoch !== operation.epoch)
+                    return;
                 if (configError)
                     ctx.ui.notify(`OpenCode: ${configError}. Automatic rotation was skipped.`, "error");
                 else {
                     invalidateAutomaticDecisions();
-                    markResponseRateLimitHandled(decision);
+                    markHandledIfOwned();
+                    ctx.ui.notify("OpenCode: HTTP 429; all other keys are quota-blocked.", "warning");
+                }
+                return;
+            }
+            if (!isCompletionCurrent(outcome))
+                return;
+            if (outcome.kind === "none") {
+                if (configError)
+                    ctx.ui.notify(`OpenCode: ${configError}. Automatic rotation was skipped.`, "error");
+                else {
+                    invalidateAutomaticDecisions();
+                    markHandledIfOwned();
                     ctx.ui.notify("OpenCode: HTTP 429; all other keys are quota-blocked.", "warning");
                 }
                 return;
             }
             invalidateAutomaticDecisions();
-            markResponseRateLimitHandled(decision);
+            markHandledIfOwned();
             const keyName = applyActiveKey(config, ctx.modelRegistry, currentTime);
-            ctx.ui.notify(`OpenCode: Proactive rate-limit detection (HTTP 429) → rotated to ${keyName ?? `key-${newIndex + 1}`}`, "info");
+            ctx.ui.notify(`OpenCode: Proactive rate-limit detection (HTTP 429) → rotated to ${keyName ?? `key-${outcome.keyIndex + 1}`}`, "info");
         });
         pi.registerCommand("opencode", {
             description: "Manage OpenCode API key rotation",
