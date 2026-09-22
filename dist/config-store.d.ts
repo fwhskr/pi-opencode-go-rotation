@@ -1,6 +1,7 @@
 export declare const CONFIG_PATH_ENV = "PI_OPENCODE_ROTATION_CONFIG";
 export declare const DEFAULT_COOLDOWN_MINUTES = 60;
 export declare const DEFAULT_WATCHDOG_IDLE_MS = 90000;
+export declare const DEFAULT_DISPATCH_DEADLINE_MS = 600000;
 export interface KeyEntry {
     name: string;
     key: string;
@@ -11,6 +12,8 @@ export interface Config {
     cooldownMinutes: number;
     watchdogEnabled: boolean;
     watchdogIdleMs: number;
+    /** Absolute wall-clock bound on one provider request, from dispatch; 0 disables it. */
+    dispatchDeadlineMs: number;
     /** Key index → epoch ms when cooldown started */
     cooldowns: Record<number, number>;
     quotaBlockedUntil: Record<number, number>;

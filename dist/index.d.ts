@@ -13,6 +13,8 @@ export interface ProviderTimeoutInfo {
     elapsedMs: number;
     idleForMs: number;
     lastStatus?: number;
+    /** Set when the absolute dispatch deadline fired instead of the activity-based idle timer. */
+    deadlineMs?: number;
 }
 export declare function shouldRotateAfterWatchdogTimeout(timeoutInfo: ProviderTimeoutInfo, rateLimitAlreadyRotated: boolean): boolean;
 export interface ClockApi {
@@ -60,6 +62,7 @@ type UsageFetchResult = {
 };
 export declare class ProviderIdleWatchdog {
     private timer;
+    private deadlineTimer;
     private active;
     private timedOut;
     private phase;
@@ -70,6 +73,7 @@ export declare class ProviderIdleWatchdog {
     private readonly options;
     constructor(options: {
         idleMs: number;
+        deadlineMs?: number;
         onTimeout: () => void;
         timers?: TimerApi;
         clock?: ClockApi;
@@ -85,7 +89,9 @@ export declare class ProviderIdleWatchdog {
     private now;
     private getTimers;
     private schedule;
+    private scheduleDeadline;
     private clear;
+    private clearDeadline;
 }
 export declare function parseOpenCodeGoUsage(value: unknown): OpenCodeGoUsageResponse | undefined;
 export declare function formatResetIn(seconds: number): string;

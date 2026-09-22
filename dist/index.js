@@ -1,4 +1,4 @@
-import { ConfigLoadError, DEFAULT_COOLDOWN_MINUTES, DEFAULT_WATCHDOG_IDLE_MS, createEmptyConfig, loadConfig, updateConfig, } from "./config-store.js";
+import { ConfigLoadError, DEFAULT_COOLDOWN_MINUTES, DEFAULT_DISPATCH_DEADLINE_MS, DEFAULT_WATCHDOG_IDLE_MS, createEmptyConfig, loadConfig, updateConfig, } from "./config-store.js";
 const PROVIDER = "opencode-go";
 const OPENCODE_GO_USAGE_URL = "https://opencode.ai/zen/go/v1/usage";
 const OPENCODE_GO_USAGE_TIMEOUT_MS = 10_000;
@@ -9,6 +9,11 @@ function getCooldownMs(config) {
 }
 function getWatchdogIdleMs(config) {
     return config.watchdogIdleMs > 0 ? config.watchdogIdleMs : DEFAULT_WATCHDOG_IDLE_MS;
+}
+function getDispatchDeadlineMs(config) {
+    return Number.isFinite(config.dispatchDeadlineMs) && config.dispatchDeadlineMs >= 0
+        ? config.dispatchDeadlineMs
+        : DEFAULT_DISPATCH_DEADLINE_MS;
 }
 export function shouldWatchProvider(provider) {
     return provider === PROVIDER;
@@ -25,6 +30,7 @@ export function shouldRotateAfterWatchdogTimeout(timeoutInfo, rateLimitAlreadyRo
 }
 export class ProviderIdleWatchdog {
     timer;
+    deadlineTimer;
     active = false;
     timedOut = false;
     phase = "waiting-for-response";
@@ -46,6 +52,7 @@ export class ProviderIdleWatchdog {
         this.lastActivityAt = now;
         this.lastStatus = undefined;
         this.schedule();
+        this.scheduleDeadline();
     }
     response(status) {
         if (!this.active || this.timedOut)
@@ -68,6 +75,7 @@ export class ProviderIdleWatchdog {
     stop() {
         this.active = false;
         this.clear();
+        this.clearDeadline();
     }
     consumeTimeoutInfo() {
         const result = this.timeoutInfo;
@@ -108,8 +116,34 @@ export class ProviderIdleWatchdog {
             this.timedOut = true;
             this.active = false;
             this.timer = undefined;
+            this.clearDeadline();
             this.options.onTimeout();
         }, this.options.idleMs);
+    }
+    scheduleDeadline() {
+        this.clearDeadline();
+        const deadlineMs = this.options.deadlineMs;
+        if (deadlineMs === undefined || deadlineMs <= 0)
+            return;
+        const timers = this.getTimers();
+        this.deadlineTimer = timers.setTimeout(() => {
+            if (!this.active || this.timedOut)
+                return;
+            const now = this.now();
+            this.timeoutInfo = {
+                phase: this.phase,
+                idleMs: this.options.idleMs,
+                elapsedMs: Math.max(0, now - this.startedAt),
+                idleForMs: Math.max(0, now - this.lastActivityAt),
+                lastStatus: this.lastStatus,
+                deadlineMs,
+            };
+            this.timedOut = true;
+            this.active = false;
+            this.deadlineTimer = undefined;
+            this.clear();
+            this.options.onTimeout();
+        }, deadlineMs);
     }
     clear() {
         if (this.timer === undefined)
@@ -117,6 +151,13 @@ export class ProviderIdleWatchdog {
         const timers = this.getTimers();
         timers.clearTimeout(this.timer);
         this.timer = undefined;
+    }
+    clearDeadline() {
+        if (this.deadlineTimer === undefined)
+            return;
+        const timers = this.getTimers();
+        timers.clearTimeout(this.deadlineTimer);
+        this.deadlineTimer = undefined;
     }
 }
 function getQuotaBlockedUntil(config, keyIndex, now) {
@@ -623,6 +664,9 @@ function formatDuration(ms) {
 }
 function formatTimeoutInfo(info) {
     const status = info.lastStatus === undefined ? "" : `, last HTTP ${info.lastStatus}`;
+    if (info.deadlineMs !== undefined) {
+        return `${info.phase.replaceAll("-", " ")} exceeded the ${formatDuration(info.deadlineMs)} dispatch deadline after ${formatDuration(info.elapsedMs)} (${formatDuration(info.idleForMs)} idle${status})`;
+    }
     return `${info.phase.replaceAll("-", " ")} stalled after ${formatDuration(info.elapsedMs)} (${formatDuration(info.idleForMs)} idle${status})`;
 }
 function formatWatchdogEvents(events, now = Date.now()) {
@@ -636,7 +680,8 @@ function formatWatchdogEvents(events, now = Date.now()) {
         const key = event.keyName ? ` key=${event.keyName}` : "";
         const rotation = event.rotatedTo ? ` rotated=${event.rotatedTo}` : event.activeKey ? ` using=${event.activeKey}` : " rotated=none";
         const status = event.lastStatus === undefined ? "" : ` status=${event.lastStatus}`;
-        return `${index + 1}. ${age} ago ${event.phase.replaceAll("-", " ")}${status}${key}${rotation} elapsed=${formatDuration(event.elapsedMs)} idle=${formatDuration(event.idleForMs)}`;
+        const deadline = event.deadlineMs === undefined ? "" : " deadline";
+        return `${index + 1}. ${age} ago ${event.phase.replaceAll("-", " ")}${deadline}${status}${key}${rotation} elapsed=${formatDuration(event.elapsedMs)} idle=${formatDuration(event.idleForMs)}`;
     })
         .join("\n");
 }
@@ -928,8 +973,10 @@ export function createOpencodeGoRotationExtension(options = {}) {
             if (!config.watchdogEnabled)
                 return;
             const idleMs = getWatchdogIdleMs(config);
+            const deadlineMs = getDispatchDeadlineMs(config);
             watchdog = new ProviderIdleWatchdog({
                 idleMs,
+                deadlineMs,
                 onTimeout: () => {
                     const rateLimitAlreadyHandled = getCurrentRequestRateLimitState()?.responseHandled ?? false;
                     invalidateAutomaticDecisions();
