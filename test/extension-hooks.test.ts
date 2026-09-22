@@ -277,6 +277,84 @@ test("hook replay aborts a no-response hang and rotates", async () => {
 	});
 });
 
+test("the default idle window, not the dispatch deadline, ends a zero-byte hang", async () => {
+	await withTempConfig(async () => {
+		const { pi, ctx, state, timers, clock } = createHarness();
+
+		await pi.emit("session_start", { reason: "start" }, ctx);
+		await pi.emit("before_provider_request", {}, ctx);
+		clock.advance(90_000);
+		timers.fireByDelay(90_000);
+
+		assert.equal(state.aborts, 1);
+		assert.match(state.notifications.join("\n"), /waiting for response stalled after 1m 30s/);
+	});
+});
+
+test("hook replay aborts a zero-byte hang at the absolute dispatch deadline", async () => {
+	await withTempConfig(async (configPath) => {
+		patchConfig(configPath, { watchdogIdleMs: 3_600_000, dispatchDeadlineMs: 60_000 });
+		const { pi, ctx, state, timers, clock } = createHarness();
+
+		await pi.emit("session_start", { reason: "start" }, ctx);
+		await pi.emit("before_provider_request", {}, ctx);
+		clock.advance(60_000);
+		timers.fireByDelay(60_000);
+		const result = await pi.emit("message_end", {
+			message: { role: "assistant", provider: "opencode-go", stopReason: "abort", errorMessage: "" },
+		}, ctx);
+
+		assert.equal(state.aborts, 1);
+		assert.deepEqual(state.runtimeKeys.at(-1), "sk-two");
+		assert.match(JSON.stringify(result), /exceeded the 1m dispatch deadline/);
+		assert.match(JSON.stringify(result), /rotated to two/);
+	});
+});
+
+test("a slow-but-progressing stream survives repeated idle windows until the dispatch deadline", async () => {
+	await withTempConfig(async (configPath) => {
+		patchConfig(configPath, { watchdogIdleMs: 90_000, dispatchDeadlineMs: 600_000 });
+		const { pi, ctx, state, timers, clock } = createHarness();
+
+		await pi.emit("session_start", { reason: "start" }, ctx);
+		await pi.emit("before_provider_request", {}, ctx);
+		for (let elapsed = 60_000; elapsed <= 300_000; elapsed += 60_000) {
+			clock.advance(60_000);
+			await pi.emit("message_update", { message: { role: "assistant", provider: "opencode-go" } }, ctx);
+		}
+		// 5 minutes of progress at 1 chunk/60s, past three 90s idle windows: still alive.
+		assert.equal(state.aborts, 0);
+
+		clock.advance(300_000);
+		timers.fireByDelay(600_000);
+
+		assert.equal(state.aborts, 1);
+		assert.match(state.notifications.join("\n"), /exceeded the 10m dispatch deadline/);
+	});
+});
+
+test("the dispatch-armed watchdog fires in real time and requests abort on a zero-byte hang", async () => {
+	await withTempConfig(async (configPath) => {
+		patchConfig(configPath, { watchdogIdleMs: 1_000, dispatchDeadlineMs: 600_000 });
+		const pi = new FakePi();
+		const state: FakeContextState = { runtimeKeys: [], notifications: [], aborts: 0 };
+		const ctx = createContext(state);
+		const extension = createOpencodeGoRotationExtension({});
+		extension(pi as unknown as ExtensionAPI);
+
+		await pi.emit("session_start", { reason: "start" }, ctx);
+		await pi.emit("before_provider_request", {}, ctx);
+
+		const deadline = Date.now() + 3_000;
+		while (state.aborts === 0 && Date.now() < deadline) {
+			await new Promise((resolve) => setTimeout(resolve, 20));
+		}
+
+		assert.equal(state.aborts, 1);
+		assert.match(state.notifications.join("\n"), /waiting for response stalled after/);
+	});
+});
+
 test("late 429 after a watchdog rotation does not rotate a second key", async () => {
 	await withTempConfig(async () => {
 		const { pi, ctx, state, timers, clock } = createHarness();

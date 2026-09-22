@@ -69,6 +69,7 @@ Keys are stored in `~/.pi/agent/opencode-keys.json` with file permissions `0600`
   "cooldownMinutes": 60,
   "watchdogEnabled": true,
   "watchdogIdleMs": 90000,
+  "dispatchDeadlineMs": 600000,
   "cooldowns": {},
   "quotaBlockedUntil": {}
 }
@@ -93,6 +94,7 @@ Set `maxRetries` to at least the number of keys so all keys get a chance before 
 
 - The watchdog is scoped to the `opencode-go` provider only. Other providers are not aborted or rotated.
 - A legitimate long-running request with no stream activity can be treated as stalled; tune with `/opencode watchdog <seconds>` or disable with `/opencode watchdog off`.
+- `dispatchDeadlineMs` is an absolute wall-clock bound on one provider request measured from dispatch (default 10 minutes, `0` disables). Unlike the activity-based idle watchdog it is never reset by stream activity, so a request that keeps trickling data without completing is still ended at the bound.
 - When all non-quota-blocked keys are transiently cooling down, the extension may clear the next eligible key's cooldown. It never automatically clears or force-selects a quota-blocked key.
 - When all keys are quota-blocked, automatic rotation stops on the current runtime key until a block expires or a manual command clears one.
 - Go plan usage limits are tied to the subscription workspace; multiple keys from one workspace should not be assumed to provide independent quota. See the [OpenCode Go documentation](https://opencode.ai/docs/go/).

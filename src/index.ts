@@ -2,6 +2,7 @@ import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-age
 import {
 	ConfigLoadError,
 	DEFAULT_COOLDOWN_MINUTES,
+	DEFAULT_DISPATCH_DEADLINE_MS,
 	DEFAULT_WATCHDOG_IDLE_MS,
 	createEmptyConfig,
 	loadConfig,
@@ -22,6 +23,12 @@ function getCooldownMs(config: Config): number {
 
 function getWatchdogIdleMs(config: Config): number {
 	return config.watchdogIdleMs > 0 ? config.watchdogIdleMs : DEFAULT_WATCHDOG_IDLE_MS;
+}
+
+function getDispatchDeadlineMs(config: Config): number {
+	return Number.isFinite(config.dispatchDeadlineMs) && config.dispatchDeadlineMs >= 0
+		? config.dispatchDeadlineMs
+		: DEFAULT_DISPATCH_DEADLINE_MS;
 }
 
 export function shouldWatchProvider(provider: string | undefined): boolean {
@@ -54,6 +61,8 @@ export interface ProviderTimeoutInfo {
 	elapsedMs: number;
 	idleForMs: number;
 	lastStatus?: number;
+	/** Set when the absolute dispatch deadline fired instead of the activity-based idle timer. */
+	deadlineMs?: number;
 }
 
 export function shouldRotateAfterWatchdogTimeout(timeoutInfo: ProviderTimeoutInfo, rateLimitAlreadyRotated: boolean): boolean {
@@ -127,6 +136,7 @@ interface RequestRateLimitState {
 
 export class ProviderIdleWatchdog {
 	private timer: unknown | undefined;
+	private deadlineTimer: unknown | undefined;
 	private active = false;
 	private timedOut = false;
 	private phase: ProviderActivityPhase = "waiting-for-response";
@@ -136,6 +146,7 @@ export class ProviderIdleWatchdog {
 	private timeoutInfo: ProviderTimeoutInfo | undefined;
 	private readonly options: {
 		idleMs: number;
+		deadlineMs?: number;
 		onTimeout: () => void;
 		timers?: TimerApi;
 		clock?: ClockApi;
@@ -143,6 +154,7 @@ export class ProviderIdleWatchdog {
 
 	constructor(options: {
 		idleMs: number;
+		deadlineMs?: number;
 		onTimeout: () => void;
 		timers?: TimerApi;
 		clock?: ClockApi;
@@ -160,6 +172,7 @@ export class ProviderIdleWatchdog {
 		this.lastActivityAt = now;
 		this.lastStatus = undefined;
 		this.schedule();
+		this.scheduleDeadline();
 	}
 
 	response(status: number): void {
@@ -183,6 +196,7 @@ export class ProviderIdleWatchdog {
 	stop(): void {
 		this.active = false;
 		this.clear();
+		this.clearDeadline();
 	}
 
 
@@ -229,8 +243,33 @@ export class ProviderIdleWatchdog {
 			this.timedOut = true;
 			this.active = false;
 			this.timer = undefined;
+			this.clearDeadline();
 			this.options.onTimeout();
 		}, this.options.idleMs);
+	}
+
+	private scheduleDeadline(): void {
+		this.clearDeadline();
+		const deadlineMs = this.options.deadlineMs;
+		if (deadlineMs === undefined || deadlineMs <= 0) return;
+		const timers = this.getTimers();
+		this.deadlineTimer = timers.setTimeout(() => {
+			if (!this.active || this.timedOut) return;
+			const now = this.now();
+			this.timeoutInfo = {
+				phase: this.phase,
+				idleMs: this.options.idleMs,
+				elapsedMs: Math.max(0, now - this.startedAt),
+				idleForMs: Math.max(0, now - this.lastActivityAt),
+				lastStatus: this.lastStatus,
+				deadlineMs,
+			};
+			this.timedOut = true;
+			this.active = false;
+			this.deadlineTimer = undefined;
+			this.clear();
+			this.options.onTimeout();
+		}, deadlineMs);
 	}
 
 	private clear(): void {
@@ -238,6 +277,13 @@ export class ProviderIdleWatchdog {
 		const timers = this.getTimers();
 		timers.clearTimeout(this.timer);
 		this.timer = undefined;
+	}
+
+	private clearDeadline(): void {
+		if (this.deadlineTimer === undefined) return;
+		const timers = this.getTimers();
+		timers.clearTimeout(this.deadlineTimer);
+		this.deadlineTimer = undefined;
 	}
 }
 
@@ -768,6 +814,7 @@ interface WatchdogEvent {
 	elapsedMs: number;
 	idleForMs: number;
 	lastStatus?: number;
+	deadlineMs?: number;
 }
 
 function formatDuration(ms: number): string {
@@ -780,6 +827,9 @@ function formatDuration(ms: number): string {
 
 function formatTimeoutInfo(info: ProviderTimeoutInfo): string {
 	const status = info.lastStatus === undefined ? "" : `, last HTTP ${info.lastStatus}`;
+	if (info.deadlineMs !== undefined) {
+		return `${info.phase.replaceAll("-", " ")} exceeded the ${formatDuration(info.deadlineMs)} dispatch deadline after ${formatDuration(info.elapsedMs)} (${formatDuration(info.idleForMs)} idle${status})`;
+	}
 	return `${info.phase.replaceAll("-", " ")} stalled after ${formatDuration(info.elapsedMs)} (${formatDuration(info.idleForMs)} idle${status})`;
 }
 
@@ -793,7 +843,8 @@ function formatWatchdogEvents(events: WatchdogEvent[], now = Date.now()): string
 			const key = event.keyName ? ` key=${event.keyName}` : "";
 			const rotation = event.rotatedTo ? ` rotated=${event.rotatedTo}` : event.activeKey ? ` using=${event.activeKey}` : " rotated=none";
 			const status = event.lastStatus === undefined ? "" : ` status=${event.lastStatus}`;
-			return `${index + 1}. ${age} ago ${event.phase.replaceAll("-", " ")}${status}${key}${rotation} elapsed=${formatDuration(event.elapsedMs)} idle=${formatDuration(event.idleForMs)}`;
+			const deadline = event.deadlineMs === undefined ? "" : " deadline";
+			return `${index + 1}. ${age} ago ${event.phase.replaceAll("-", " ")}${deadline}${status}${key}${rotation} elapsed=${formatDuration(event.elapsedMs)} idle=${formatDuration(event.idleForMs)}`;
 		})
 		.join("\n");
 }
@@ -1087,8 +1138,10 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 			clearWatchdogTimeoutGuard();
 			if (!config.watchdogEnabled) return;
 			const idleMs = getWatchdogIdleMs(config);
+			const deadlineMs = getDispatchDeadlineMs(config);
 			watchdog = new ProviderIdleWatchdog({
 				idleMs,
+				deadlineMs,
 				onTimeout: () => {
 					const rateLimitAlreadyHandled = getCurrentRequestRateLimitState()?.responseHandled ?? false;
 					invalidateAutomaticDecisions();

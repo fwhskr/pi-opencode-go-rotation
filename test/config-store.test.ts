@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawn } from "node:child_process";
 import test from "node:test";
-import { createEmptyConfig, ConfigLoadError, loadConfig, updateConfig, writeConfig } from "../src/config-store.ts";
+import { createEmptyConfig, ConfigLoadError, DEFAULT_DISPATCH_DEADLINE_MS, DEFAULT_WATCHDOG_IDLE_MS, loadConfig, updateConfig, writeConfig } from "../src/config-store.ts";
 
 function makeConfigPath(): { directory: string; path: string } {
 	const directory = mkdtempSync(join(tmpdir(), "opencode-rotation-store-test-"));
@@ -70,6 +70,31 @@ test("invalid JSON is reported without replacing the file with an empty config",
 		});
 		assert.equal(readFileSync(path, "utf-8"), invalidContent);
 		assert.equal(existsSync(`${path}.lock`), false);
+	} finally {
+		removeDirectory(directory);
+	}
+});
+
+test("dispatchDeadlineMs defaults to the explicit outer bound and accepts a config override", () => {
+	const { directory, path } = makeConfigPath();
+	try {
+		assert.equal(createEmptyConfig().dispatchDeadlineMs, DEFAULT_DISPATCH_DEADLINE_MS);
+		assert.equal(DEFAULT_DISPATCH_DEADLINE_MS, 600_000);
+
+		// An absent key migrates to the safe default; the watchdog idle bound is distinct.
+		writeConfig({ ...createEmptyConfig(), keys: [{ name: "one", key: "sk-one" }] }, path);
+		assert.equal(loadConfig(path).dispatchDeadlineMs, DEFAULT_DISPATCH_DEADLINE_MS);
+		assert.equal(loadConfig(path).watchdogIdleMs, DEFAULT_WATCHDOG_IDLE_MS);
+
+		writeFileSync(path, JSON.stringify({ keys: [{ name: "one", key: "sk-one" }], dispatchDeadlineMs: 30_000 }), { mode: 0o600 });
+		assert.equal(loadConfig(path).dispatchDeadlineMs, 30_000);
+
+		// 0 disables the outer bound.
+		writeFileSync(path, JSON.stringify({ keys: [{ name: "one", key: "sk-one" }], dispatchDeadlineMs: 0 }), { mode: 0o600 });
+		assert.equal(loadConfig(path).dispatchDeadlineMs, 0);
+
+		writeFileSync(path, JSON.stringify({ keys: [{ name: "one", key: "sk-one" }], dispatchDeadlineMs: -1 }), { mode: 0o600 });
+		assert.throws(() => loadConfig(path), (error: unknown) => error instanceof ConfigLoadError);
 	} finally {
 		removeDirectory(directory);
 	}
