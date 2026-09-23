@@ -24,11 +24,12 @@ The first key added becomes active immediately.
 
 The extension sets the active key as a runtime override, which takes priority over `OPENCODE_API_KEY` environment variables and `auth.json` credentials.
 
-The extension has three recovery paths:
+The extension has four recovery paths:
 
 1. **Usage-verified Go quota exhaustion**: when OpenCode Go returns HTTP 429, the extension sends the active key only to `https://opencode.ai/zen/go/v1/usage`. If a usage window is `rate-limited`, the failed key is blocked until the latest reported reset and the next non-quota-blocked key is activated. Rotation prefers keys outside transient cooldown, but can clear a cooldown rather than keep using an exhausted key. Repeated failures try each configured key once. When every key is quota-blocked, rotation stops and reports the earliest reset instead of cycling.
 2. **Transient limit errors**: when the usage endpoint is unavailable, does not report a rate-limited window, or does not finish within 10 seconds, the extension preserves the existing transient 429 behavior. It aborts a timed-out usage request, marks the current key as on cooldown, switches to the next key that is not quota-blocked, and applies it via `setRuntimeApiKey`.
 3. **Silent stalls**: when an `opencode-go` provider request has no response or stream activity for the watchdog window, the extension rotates to an eligible key, aborts the hung turn, and rewrites the abort as a retryable timeout error.
+4. **Entitlement (subscription) 403**: when a request fails with an entitlement 403 (`EntitlementError` or a missing OpenCode Go subscription), the failed key is blocked for 30 days at the account level and the next usable key takes over; if no other key is usable the extension reports the missing subscription instead of a rate-limit message.
 
 This is still reactive: it does not poll usage or check limits before normal requests.
 

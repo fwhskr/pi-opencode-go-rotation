@@ -1,6 +1,6 @@
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 export declare function shouldWatchProvider(provider: string | undefined): boolean;
-export type RateLimitKind = "transient" | "fixed-window-quota";
+export type RateLimitKind = "transient" | "fixed-window-quota" | "entitlement";
 export declare function classifyRateLimitError(message: string): RateLimitKind | undefined;
 export interface TimerApi {
     setTimeout(callback: () => void, ms: number): unknown;

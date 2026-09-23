@@ -15,6 +15,11 @@ const OPENCODE_GO_USAGE_URL = "https://opencode.ai/zen/go/v1/usage";
 const OPENCODE_GO_USAGE_TIMEOUT_MS = 10_000;
 const FIXED_WINDOW_QUOTA_RE = /\b(?:5[- ]hour|weekly|monthly)\b[\s\S]*\b(?:usage\s+)?(?:quota|limit)\b|\b(?:usage|plan)\s+allocated\s+quota\s+exceeded\b|\b(?:quota|limit)\b[\s\S]*\b(?:will\s+reset|resets?\s+at|fixed[- ]window)\b/i;
 const TRANSIENT_RATE_LIMIT_RE = /\b429\b|rate.?limit|too many requests|quota|usage limit|limit reached/i;
+const ENTITLEMENT_ERROR_RE = /\b403\b|EntitlementError|no active subscription|subscription[^\n]{0,80}\brequired\b/i;
+// An entitlement 403 is account-level: rotation recovers when another configured key
+// belongs to an entitled account. A 403 usage probe reports no confirmed headroom, so
+// the persisted block survives session-start re-probes.
+const ENTITLEMENT_BLOCK_MS = 30 * 24 * 60 * 60 * 1000;
 
 
 function getCooldownMs(config: Config): number {
@@ -35,10 +40,11 @@ export function shouldWatchProvider(provider: string | undefined): boolean {
 	return provider === PROVIDER;
 }
 
-export type RateLimitKind = "transient" | "fixed-window-quota";
+export type RateLimitKind = "transient" | "fixed-window-quota" | "entitlement";
 
 export function classifyRateLimitError(message: string): RateLimitKind | undefined {
 	if (FIXED_WINDOW_QUOTA_RE.test(message)) return "fixed-window-quota";
+	if (ENTITLEMENT_ERROR_RE.test(message)) return "entitlement";
 	if (TRANSIENT_RATE_LIMIT_RE.test(message)) return "transient";
 	return undefined;
 }
@@ -1324,6 +1330,48 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 				invalidateAutomaticDecisions();
 				const keyName = applyActiveKey(config, ctx.modelRegistry, currentTime) ?? `key-${outcome.keyIndex + 1}`;
 				ctx.ui.notify(`OpenCode: ${exhaustedName} reached its plan quota → rotated to ${keyName}`, "info");
+				return;
+			}
+			if (rateLimitKind === "entitlement") {
+				const currentTime = now();
+				const blockedUntil = currentTime + ENTITLEMENT_BLOCK_MS;
+				const exhaustedName = config.keys[requestState.decision.target.keyIndex]?.name
+					|| `key-${requestState.decision.target.keyIndex + 1}`;
+				if (requestState.responseHandled) {
+					const persisted = mutateSharedConfig((freshConfig) => {
+						// The handled response may block only its own credential, never whatever
+						// credential now occupies that index.
+						if (!matchesUsageTarget(freshConfig, requestState.decision.target)) return false;
+						setQuotaBlock(freshConfig, requestState.decision.target.keyIndex, blockedUntil, currentTime);
+						return true;
+					});
+					if (persisted !== true && configError) ctx.ui.notify(`OpenCode: ${configError}.`, "error");
+					invalidateAutomaticDecisions();
+					return;
+				}
+				const operation = currentRotationOperation(currentTime);
+				if (!operation || operation.selection.keyIndex !== requestState.decision.target.keyIndex) return;
+				const outcome = await rotateWithRecovery(ctx, operation, currentTime, {
+					kind: "quota",
+					blockedUntil,
+					authoritative: false,
+				});
+				if (outcome.kind === "cancelled") return;
+				if (outcome.kind === "unavailable") {
+					if (usageDecisionEpoch !== operation.epoch) return;
+					ctx.ui.notify(`OpenCode: ${configError}. Automatic rotation was skipped.`, "error");
+					return;
+				}
+				// Never finalize a decision that lost ownership while the rotation was in flight.
+				if (!isCompletionCurrent(outcome)) return;
+				if (outcome.kind === "none") {
+					invalidateAutomaticDecisions();
+					ctx.ui.notify(`OpenCode: ${exhaustedName} has no OpenCode Go subscription; no other key available.`, "warning");
+					return;
+				}
+				invalidateAutomaticDecisions();
+				const keyName = applyActiveKey(config, ctx.modelRegistry, currentTime) ?? `key-${outcome.keyIndex + 1}`;
+				ctx.ui.notify(`OpenCode: ${exhaustedName} has no Go entitlement (subscription required) -> rotated to ${keyName}`, "info");
 				return;
 			}
 			if (requestState.responseHandled) {

@@ -8,7 +8,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import assert from "node:assert/strict";
 import test from "node:test";
-import { createOpencodeGoRotationExtension, parseOpenCodeGoUsage } from "../src/index.ts";
+import { classifyRateLimitError, createOpencodeGoRotationExtension, parseOpenCodeGoUsage } from "../src/index.ts";
 
 interface FakeTimerEntry {
 	callback: () => void;
@@ -1623,5 +1623,84 @@ test("a stale uncertain recovery cannot report exhaustion for a superseded decis
 		await pending;
 
 		assert.doesNotMatch(state.notifications.join("\n"), /all other keys are quota-blocked/);
+	});
+});
+
+// ---------------------------------------------------------------------------
+// Entitlement (subscription) 403 rotation
+// ---------------------------------------------------------------------------
+
+const entitlementChatError = `opencode-go API error (403): {"type":"server_error","message":"Upstream request failed: An active OpenCode Go subscription is required to use Go models."}`;
+const entitlementUsageError = `GET https://opencode.ai/zen/go/v1/usage -> HTTP 403 EntitlementError "OpenCode Go subscription required."`;
+const entitlementBlockMs = 30 * 24 * 60 * 60 * 1000;
+
+test("classifyRateLimitError flags the live entitlement 403 strings without reclassifying quota or transient errors", () => {
+	assert.equal(classifyRateLimitError(entitlementChatError), "entitlement");
+	assert.equal(classifyRateLimitError(entitlementUsageError), "entitlement");
+	assert.equal(
+		classifyRateLimitError("You have exceeded the 5-hour usage quota. It will reset at 2026-08-01T12:00:00Z"),
+		"fixed-window-quota",
+	);
+	assert.equal(classifyRateLimitError("429 rate limit"), "transient");
+	assert.equal(classifyRateLimitError("provider unavailable"), undefined);
+});
+
+test("an entitlement 403 at message end rotates and persists a long block on the failed key", async () => {
+	await withTempConfig(async (configPath) => {
+		patchConfig(configPath, { keys: twoKeys });
+		const { pi, ctx, state } = createHarness();
+
+		await pi.emit("session_start", { reason: "start" }, ctx);
+		await pi.emit("before_provider_request", {}, ctx);
+		await pi.emit("message_end", assistantError(entitlementChatError), ctx);
+
+		assert.equal(state.runtimeKeys.at(-1), "sk-two");
+		const config = readConfig(configPath);
+		assert.equal(config.activeKeyIndex, 1);
+		assert.equal(config.quotaBlockedUntil?.["0"], entitlementBlockMs);
+		assert.notEqual(config.quotaBlockedUntil?.["0"], 60 * 60 * 1000, "an entitlement block is not the 60-minute cooldown");
+		assert.match(state.notifications.join("\n"), /one has no Go entitlement \(subscription required\) -> rotated to two/);
+
+		// The next selection does not pick the blocked index, and the block survives
+		// the session-start usage re-probe.
+		await pi.emit("session_start", { reason: "resume" }, ctx);
+		const afterRestart = readConfig(configPath);
+		assert.equal(afterRestart.activeKeyIndex, 1);
+		assert.equal(afterRestart.quotaBlockedUntil?.["0"], entitlementBlockMs);
+	});
+});
+
+test("an entitlement 403 with no usable key reports entitlement exhaustion instead of a rate-limit message", async () => {
+	await withTempConfig(async (configPath) => {
+		patchConfig(configPath, { keys: twoKeys, quotaBlockedUntil: { 1: 9_999_999 } });
+		const { pi, ctx, state } = createHarness();
+
+		await pi.emit("session_start", { reason: "start" }, ctx);
+		await pi.emit("before_provider_request", {}, ctx);
+		await pi.emit("message_end", assistantError(entitlementUsageError), ctx);
+
+		const notifications = state.notifications.join("\n");
+		assert.match(notifications, /one has no OpenCode Go subscription; no other key available\./);
+		assert.doesNotMatch(notifications, /reached its plan quota/);
+		assert.doesNotMatch(notifications, /Rate limited|Rate-limited|all other keys are quota-blocked/);
+		assert.equal(state.runtimeKeys.at(-1), "sk-one");
+		assert.equal(readConfig(configPath).quotaBlockedUntil?.["0"], entitlementBlockMs);
+	});
+});
+
+test("an already-handled response persists the entitlement block without rotating twice", async () => {
+	await withTempConfig(async (configPath) => {
+		const { pi, ctx, state } = createHarness();
+
+		await pi.emit("session_start", { reason: "start" }, ctx);
+		await pi.emit("before_provider_request", {}, ctx);
+		await pi.emit("after_provider_response", { status: 429 }, ctx);
+		assert.equal(state.runtimeKeys.at(-1), "sk-two");
+
+		await pi.emit("message_end", assistantError(entitlementChatError), ctx);
+
+		assert.equal(readConfig(configPath).quotaBlockedUntil?.["0"], entitlementBlockMs);
+		assert.deepEqual(state.runtimeKeys, ["sk-one", "sk-two"]);
+		assert.doesNotMatch(state.notifications.join("\n"), /has no Go entitlement/);
 	});
 });
