@@ -754,6 +754,8 @@ function blockQuotaAndSelectNext(config: Config, keyIndex: number, blockedUntil:
 	} else {
 		setQuotaBlock(config, keyIndex, blockedUntil, now);
 	}
+	// The quota deadline replaces a generic cooldown, including short rolling resets.
+	delete config.cooldowns[keyIndex];
 	let next = pickAvailableKeyIndex(config, now);
 	if (next === undefined) {
 		for (let offset = 1; offset <= config.keys.length; offset++) {
@@ -1031,11 +1033,33 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 			mode: RotationMode,
 		): Promise<RotationOutcome> {
 			const startIndex = operation.selection.keyIndex;
+			// Persist candidate usage before the fast path: an expired cooldown is not headroom.
+			const candidates = config.keys
+				.map((_, index) => captureSelectionSnapshot(config, currentTime, index))
+				.filter((snapshot): snapshot is SelectionSnapshot => snapshot !== undefined
+					&& snapshot.keyIndex !== startIndex
+					&& getQuotaBlockedUntil(config, snapshot.keyIndex, currentTime) === undefined);
+			const readings: { snapshot: SelectionSnapshot; usage: UsageFetchResult }[] = [];
+			for (const snapshot of candidates) {
+				readings.push({ snapshot, usage: await fetchOpenCodeGoUsage(snapshot, fetchApi, options.timers) });
+			}
 			const fast = mutateSharedConfig((freshConfig): LockedStep<number | undefined> => {
-				if (!isRotationOperationCurrent(operation, freshConfig, usageDecisionEpoch)) {
+				if (!isRotationOperationCurrent(operation, freshConfig, usageDecisionEpoch)
+					|| !readings.every(({ snapshot }) => matchesSelectionSnapshot(freshConfig, snapshot, currentTime))) {
 					return { outcome: "cancelled" };
 				}
-				return { outcome: "done", value: selectNextKey(mode, freshConfig, startIndex, currentTime) };
+				for (const { snapshot, usage } of readings) {
+					if (usage.ok && hasRateLimitedUsageWindow(usage)) {
+						setQuotaBlock(freshConfig, snapshot.keyIndex, getRateLimitedUntil(usage.usage, currentTime, getCooldownMs(freshConfig)), currentTime);
+						delete freshConfig.cooldowns[snapshot.keyIndex];
+					} else if (hasConfirmedHeadroom(usage)) {
+						delete freshConfig.cooldowns[snapshot.keyIndex];
+					}
+				}
+				const next = selectNextKey(mode, freshConfig, startIndex, currentTime);
+				const healthy = readings.find(({ usage }) => hasConfirmedHeadroom(usage));
+				if (healthy) freshConfig.activeKeyIndex = healthy.snapshot.keyIndex;
+				return { outcome: "done", value: healthy?.snapshot.keyIndex ?? next };
 			});
 			if (fast === undefined) return { kind: "unavailable" };
 			if (fast.outcome === "cancelled") return { kind: "cancelled" };

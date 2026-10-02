@@ -207,7 +207,23 @@ function createHarness(registryShape: "authStorage" | "runtime" = "authStorage",
 	return { pi, ctx, state, timers, clock };
 }
 
-test("usage helpers parse the upstream response shape", () => {
+test("rotation prefers confirmed headroom over exhausted accounts and cooldowns", async () => {
+	await withTempConfig(async (configPath) => {
+		patchConfig(configPath, { activeKeyIndex: 0, cooldowns: { 2: 0 } });
+		const { pi, ctx, state, clock } = createHarness("runtime", async (_url, init) =>
+			init.headers.Authorization === "Bearer sk-three"
+				? activeUsage()
+				: usageResponse([{ name: "weekly", status: "rate-limited", resetInSec: 259200 }]));
+		clock.advance(1000);
+		await pi.emit("before_provider_request", { payload: {} }, ctx);
+		await pi.emit("after_provider_response", { status: 429 }, ctx);
+		console.log("TASK-701 selected:", state.runtimeKeys.at(-1), "config:", JSON.stringify(readConfig(configPath)));
+		assert.equal(state.runtimeKeys.at(-1), "sk-three");
+		assert.ok((readConfig(configPath).quotaBlockedUntil?.["1"] ?? 0) > clock.time);
+	});
+});
+
+ test("usage helpers parse the upstream response shape", () => {
 	const rollingWindow = {
 		name: "rolling",
 		status: "active",
