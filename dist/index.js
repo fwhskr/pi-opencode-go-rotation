@@ -9,6 +9,33 @@ const ENTITLEMENT_ERROR_RE = /\b403\b|EntitlementError|no active subscription|su
 // belongs to an entitled account. A 403 usage probe reports no confirmed headroom, so
 // the persisted block survives session-start re-probes.
 const ENTITLEMENT_BLOCK_MS = 30 * 24 * 60 * 60 * 1000;
+// A session replacement invalidates the old extension context (Pi docs, "Context
+// and session changes"). A provider-response hook or a deferred watchdog timer
+// that lands afterwards throws on its first ctx read; drop only that documented
+// staleness so the event is discarded, and re-throw anything else. Shared
+// convention with agent-fallback-chain.ts.
+const STALE_CONTEXT_MARKER = "ctx is stale after session replacement or reload";
+function isStaleContextError(error) {
+    return error instanceof Error && error.message.includes(STALE_CONTEXT_MARKER);
+}
+function withLiveContext(ctx, action) {
+    try {
+        action(ctx);
+    }
+    catch (error) {
+        if (!isStaleContextError(error))
+            throw error;
+    }
+}
+async function withLiveContextAsync(ctx, action) {
+    try {
+        await action(ctx);
+    }
+    catch (error) {
+        if (!isStaleContextError(error))
+            throw error;
+    }
+}
 function getCooldownMs(config) {
     return (config.cooldownMinutes || DEFAULT_COOLDOWN_MINUTES) * 60_000;
 }
@@ -984,7 +1011,7 @@ export function createOpencodeGoRotationExtension(options = {}) {
             watchdog = new ProviderIdleWatchdog({
                 idleMs,
                 deadlineMs,
-                onTimeout: () => {
+                onTimeout: () => withLiveContext(ctx, (liveCtx) => {
                     const rateLimitAlreadyHandled = getCurrentRequestRateLimitState()?.responseHandled ?? false;
                     invalidateAutomaticDecisions();
                     watchdogRequestTimedOut = true;
@@ -995,7 +1022,7 @@ export function createOpencodeGoRotationExtension(options = {}) {
                         idleForMs: idleMs,
                     };
                     const previousKey = config.keys[config.activeKeyIndex]?.name;
-                    const rotation = rotateForWatchdog(ctx, timeoutInfo, rateLimitAlreadyHandled);
+                    const rotation = rotateForWatchdog(liveCtx, timeoutInfo, rateLimitAlreadyHandled);
                     watchdogTimeoutInfo = timeoutInfo;
                     recordWatchdogEvent({
                         time: now(),
@@ -1008,9 +1035,9 @@ export function createOpencodeGoRotationExtension(options = {}) {
                     watchdogAbortMessage = rotation.keyName
                         ? `OpenCode Go timeout: ${formatTimeoutInfo(timeoutInfo)}; ${rotation.rotated ? "rotated to" : "using"} ${rotation.keyName}; retrying.`
                         : `OpenCode Go timeout: ${formatTimeoutInfo(timeoutInfo)}; no other key available.`;
-                    ctx.ui.notify(watchdogAbortMessage, rotation.keyName ? "info" : "warning");
-                    ctx.abort();
-                },
+                    liveCtx.ui.notify(watchdogAbortMessage, rotation.keyName ? "info" : "warning");
+                    liveCtx.abort();
+                }),
                 timers: options.timers,
                 clock: options.clock,
             });
@@ -1266,7 +1293,10 @@ export function createOpencodeGoRotationExtension(options = {}) {
             const keyName = applyActiveKey(config, ctx.modelRegistry, currentTime);
             ctx.ui.notify(`OpenCode: Rate-limited → rotated to ${keyName ?? `key-${outcome.keyIndex + 1}`}`, "info");
         });
-        pi.on("after_provider_response", async (event, ctx) => {
+        pi.on("after_provider_response", async (event, handlerCtx) => withLiveContextAsync(handlerCtx, async (ctx) => {
+            // A response that arrives after a session replacement carries an invalidated
+            // ctx; drop it (the new session owns recovery) instead of throwing into the
+            // runtime error channel.
             if (ctx.model?.provider !== PROVIDER)
                 return;
             watchdog?.response(event.status);
@@ -1363,7 +1393,7 @@ export function createOpencodeGoRotationExtension(options = {}) {
             markHandledIfOwned();
             const keyName = applyActiveKey(config, ctx.modelRegistry, currentTime);
             ctx.ui.notify(`OpenCode: Proactive rate-limit detection (HTTP 429) → rotated to ${keyName ?? `key-${outcome.keyIndex + 1}`}`, "info");
-        });
+        }));
         pi.registerCommand("opencode", {
             description: "Manage OpenCode API key rotation",
             handler: async (args, ctx) => {

@@ -21,6 +21,33 @@ const ENTITLEMENT_ERROR_RE = /\b403\b|EntitlementError|no active subscription|su
 // the persisted block survives session-start re-probes.
 const ENTITLEMENT_BLOCK_MS = 30 * 24 * 60 * 60 * 1000;
 
+// A session replacement invalidates the old extension context (Pi docs, "Context
+// and session changes"). A provider-response hook or a deferred watchdog timer
+// that lands afterwards throws on its first ctx read; drop only that documented
+// staleness so the event is discarded, and re-throw anything else. Shared
+// convention with agent-fallback-chain.ts.
+const STALE_CONTEXT_MARKER = "ctx is stale after session replacement or reload";
+
+function isStaleContextError(error: unknown): boolean {
+	return error instanceof Error && error.message.includes(STALE_CONTEXT_MARKER);
+}
+
+function withLiveContext<T>(ctx: T, action: (liveCtx: T) => void): void {
+	try {
+		action(ctx);
+	} catch (error) {
+		if (!isStaleContextError(error)) throw error;
+	}
+}
+
+async function withLiveContextAsync<T>(ctx: T, action: (liveCtx: T) => Promise<void>): Promise<void> {
+	try {
+		await action(ctx);
+	} catch (error) {
+		if (!isStaleContextError(error)) throw error;
+	}
+}
+
 
 function getCooldownMs(config: Config): number {
 	return (config.cooldownMinutes || DEFAULT_COOLDOWN_MINUTES) * 60_000;
@@ -1148,7 +1175,7 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 			watchdog = new ProviderIdleWatchdog({
 				idleMs,
 				deadlineMs,
-				onTimeout: () => {
+				onTimeout: () => withLiveContext(ctx, (liveCtx) => {
 					const rateLimitAlreadyHandled = getCurrentRequestRateLimitState()?.responseHandled ?? false;
 					invalidateAutomaticDecisions();
 					watchdogRequestTimedOut = true;
@@ -1159,7 +1186,7 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 						idleForMs: idleMs,
 					};
 					const previousKey = config.keys[config.activeKeyIndex]?.name;
-					const rotation = rotateForWatchdog(ctx, timeoutInfo, rateLimitAlreadyHandled);
+					const rotation = rotateForWatchdog(liveCtx, timeoutInfo, rateLimitAlreadyHandled);
 					watchdogTimeoutInfo = timeoutInfo;
 					recordWatchdogEvent({
 						time: now(),
@@ -1172,9 +1199,9 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 					watchdogAbortMessage = rotation.keyName
 						? `OpenCode Go timeout: ${formatTimeoutInfo(timeoutInfo)}; ${rotation.rotated ? "rotated to" : "using"} ${rotation.keyName}; retrying.`
 						: `OpenCode Go timeout: ${formatTimeoutInfo(timeoutInfo)}; no other key available.`;
-					ctx.ui.notify(watchdogAbortMessage, rotation.keyName ? "info" : "warning");
-					ctx.abort();
-				},
+					liveCtx.ui.notify(watchdogAbortMessage, rotation.keyName ? "info" : "warning");
+					liveCtx.abort();
+				}),
 				timers: options.timers,
 				clock: options.clock,
 			});
@@ -1407,83 +1434,86 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 			ctx.ui.notify(`OpenCode: Rate-limited → rotated to ${keyName ?? `key-${outcome.keyIndex + 1}`}`, "info");
 		});
 
-		pi.on("after_provider_response", async (event, ctx) => {
-			if (ctx.model?.provider !== PROVIDER) return;
-			watchdog?.response(event.status);
-			if (event.status !== 429 && event.status !== 401) return;
-			if (watchdogRequestTimedOut) return;
-			if (!refreshConfig()) return;
-			const requestState = getCurrentRequestRateLimitState();
-			if (!requestState) return;
-			const decision = requestState.decision;
-			const operation = currentRotationOperation(now());
-			if (!operation || operation.selection.keyIndex !== decision.target.keyIndex) return;
-			// Bookkeeping for this response is allowed only while it still owns the request state.
-			const markHandledIfOwned = () => {
-				if (requestRateLimitState === requestState) markResponseRateLimitHandled(decision);
-			};
-			if (event.status === 401) requestRateLimitState = undefined;
-			const usage = await fetchOpenCodeGoUsage(decision.target, fetchApi, options.timers);
-			if (!refreshConfig()) return;
-			if (!isRotationOperationCurrent(operation, config, usageDecisionEpoch)) return;
-			const currentTime = now();
-			const exhaustedName = config.keys[decision.target.keyIndex]?.name || `key-${decision.target.keyIndex + 1}`;
-			if (usage.ok && hasRateLimitedUsageWindow(usage)) {
-				const outcome = await rotateWithRecovery(ctx, operation, currentTime, {
-					kind: "quota",
-					blockedUntil: getRateLimitedUntil(usage.usage, currentTime, getCooldownMs(config)),
-					authoritative: false,
-				});
+		pi.on("after_provider_response", async (event, handlerCtx) => withLiveContextAsync(handlerCtx, async (ctx) => {
+				// A response that arrives after a session replacement carries an invalidated
+				// ctx; drop it (the new session owns recovery) instead of throwing into the
+				// runtime error channel.
+				if (ctx.model?.provider !== PROVIDER) return;
+				watchdog?.response(event.status);
+				if (event.status !== 429 && event.status !== 401) return;
+				if (watchdogRequestTimedOut) return;
+				if (!refreshConfig()) return;
+				const requestState = getCurrentRequestRateLimitState();
+				if (!requestState) return;
+				const decision = requestState.decision;
+				const operation = currentRotationOperation(now());
+				if (!operation || operation.selection.keyIndex !== decision.target.keyIndex) return;
+				// Bookkeeping for this response is allowed only while it still owns the request state.
+				const markHandledIfOwned = () => {
+					if (requestRateLimitState === requestState) markResponseRateLimitHandled(decision);
+				};
+				if (event.status === 401) requestRateLimitState = undefined;
+				const usage = await fetchOpenCodeGoUsage(decision.target, fetchApi, options.timers);
+				if (!refreshConfig()) return;
+				if (!isRotationOperationCurrent(operation, config, usageDecisionEpoch)) return;
+				const currentTime = now();
+				const exhaustedName = config.keys[decision.target.keyIndex]?.name || `key-${decision.target.keyIndex + 1}`;
+				if (usage.ok && hasRateLimitedUsageWindow(usage)) {
+					const outcome = await rotateWithRecovery(ctx, operation, currentTime, {
+						kind: "quota",
+						blockedUntil: getRateLimitedUntil(usage.usage, currentTime, getCooldownMs(config)),
+						authoritative: false,
+					});
+					if (outcome.kind === "cancelled") return;
+					if (outcome.kind === "unavailable") {
+						if (usageDecisionEpoch !== operation.epoch) return;
+						reportQuotaExhausted(ctx, exhaustedName, currentTime);
+					} else if (!isCompletionCurrent(outcome)) {
+						return;
+					} else if (outcome.kind === "rotated") {
+						invalidateAutomaticDecisions();
+						const keyName = applyActiveKey(config, ctx.modelRegistry, currentTime) ?? `key-${outcome.keyIndex + 1}`;
+						ctx.ui.notify(`OpenCode: ${exhaustedName} reached its plan quota → rotated to ${keyName}`, "info");
+					} else {
+						reportQuotaExhausted(ctx, exhaustedName, currentTime);
+					}
+					if (event.status === 429) markHandledIfOwned();
+					ctx.ui.notify(formatUsageStatus(usage), "warning");
+					return;
+				}
+				if (event.status === 401) return;
+				if (config.keys.length <= 1) {
+					markHandledIfOwned();
+					return;
+				}
+
+				const outcome = await rotateWithRecovery(ctx, operation, currentTime, { kind: "cooldown" });
 				if (outcome.kind === "cancelled") return;
 				if (outcome.kind === "unavailable") {
 					if (usageDecisionEpoch !== operation.epoch) return;
-					reportQuotaExhausted(ctx, exhaustedName, currentTime);
-				} else if (!isCompletionCurrent(outcome)) {
+					if (configError) ctx.ui.notify(`OpenCode: ${configError}. Automatic rotation was skipped.`, "error");
+					else {
+						invalidateAutomaticDecisions();
+						markHandledIfOwned();
+						ctx.ui.notify("OpenCode: HTTP 429; all other keys are quota-blocked.", "warning");
+					}
 					return;
-				} else if (outcome.kind === "rotated") {
-					invalidateAutomaticDecisions();
-					const keyName = applyActiveKey(config, ctx.modelRegistry, currentTime) ?? `key-${outcome.keyIndex + 1}`;
-					ctx.ui.notify(`OpenCode: ${exhaustedName} reached its plan quota → rotated to ${keyName}`, "info");
-				} else {
-					reportQuotaExhausted(ctx, exhaustedName, currentTime);
 				}
-				if (event.status === 429) markHandledIfOwned();
-				ctx.ui.notify(formatUsageStatus(usage), "warning");
-				return;
-			}
-			if (event.status === 401) return;
-			if (config.keys.length <= 1) {
+				if (!isCompletionCurrent(outcome)) return;
+				if (outcome.kind === "none") {
+					if (configError) ctx.ui.notify(`OpenCode: ${configError}. Automatic rotation was skipped.`, "error");
+					else {
+						invalidateAutomaticDecisions();
+						markHandledIfOwned();
+						ctx.ui.notify("OpenCode: HTTP 429; all other keys are quota-blocked.", "warning");
+					}
+					return;
+				}
+				invalidateAutomaticDecisions();
 				markHandledIfOwned();
-				return;
-			}
-
-			const outcome = await rotateWithRecovery(ctx, operation, currentTime, { kind: "cooldown" });
-			if (outcome.kind === "cancelled") return;
-			if (outcome.kind === "unavailable") {
-				if (usageDecisionEpoch !== operation.epoch) return;
-				if (configError) ctx.ui.notify(`OpenCode: ${configError}. Automatic rotation was skipped.`, "error");
-				else {
-					invalidateAutomaticDecisions();
-					markHandledIfOwned();
-					ctx.ui.notify("OpenCode: HTTP 429; all other keys are quota-blocked.", "warning");
-				}
-				return;
-			}
-			if (!isCompletionCurrent(outcome)) return;
-			if (outcome.kind === "none") {
-				if (configError) ctx.ui.notify(`OpenCode: ${configError}. Automatic rotation was skipped.`, "error");
-				else {
-					invalidateAutomaticDecisions();
-					markHandledIfOwned();
-					ctx.ui.notify("OpenCode: HTTP 429; all other keys are quota-blocked.", "warning");
-				}
-				return;
-			}
-			invalidateAutomaticDecisions();
-			markHandledIfOwned();
-			const keyName = applyActiveKey(config, ctx.modelRegistry, currentTime);
-			ctx.ui.notify(`OpenCode: Proactive rate-limit detection (HTTP 429) → rotated to ${keyName ?? `key-${outcome.keyIndex + 1}`}`, "info");
-		});
+				const keyName = applyActiveKey(config, ctx.modelRegistry, currentTime);
+				ctx.ui.notify(`OpenCode: Proactive rate-limit detection (HTTP 429) → rotated to ${keyName ?? `key-${outcome.keyIndex + 1}`}`, "info");
+		}));
 
 		pi.registerCommand("opencode", {
 			description: "Manage OpenCode API key rotation",
