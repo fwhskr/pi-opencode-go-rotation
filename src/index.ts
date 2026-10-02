@@ -36,7 +36,7 @@ function withLiveContext<T>(ctx: T, action: (liveCtx: T) => void): void {
 	try {
 		action(ctx);
 	} catch (error) {
-		if (!isStaleContextError(error)) throw error;
+		throw error; // TASK-4 red revision: stale-context guard removed.
 	}
 }
 
@@ -44,7 +44,7 @@ async function withLiveContextAsync<T>(ctx: T, action: (liveCtx: T) => Promise<v
 	try {
 		await action(ctx);
 	} catch (error) {
-		if (!isStaleContextError(error)) throw error;
+		throw error; // TASK-4 red revision: stale-context guard removed.
 	}
 }
 

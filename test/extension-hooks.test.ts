@@ -1750,3 +1750,52 @@ test("an already-handled response persists the entitlement block without rotatin
 		assert.doesNotMatch(state.notifications.join("\n"), /has no Go entitlement/);
 	});
 });
+
+const staleContextError = new Error("This extension ctx is stale after session replacement or reload. Do not use a captured pi or command ctx after ctx.newSession(), ctx.fork(), ctx.switchSession(), or ctx.reload().");
+
+// Model the runtime extension-error channel for hooks and deferred callbacks.
+// Replacement invalidates captured getters; it does not cancel an in-flight response.
+for (const path of ["late response", "idle watchdog", "dispatch deadline"] as const) {
+	test(`TASK-4 session replacement: ${path} emits no stale-context error`, async () => {
+		await withTempConfig(async () => {
+			const { pi, ctx, state, clock, timers } = createHarness();
+			let invalidated = false;
+			const capturedCtx = new Proxy(ctx, {
+				get(target, property, receiver) {
+					if (invalidated) throw staleContextError;
+					return Reflect.get(target, property, receiver);
+				},
+			});
+			await pi.emit("session_start", { reason: "start" }, capturedCtx);
+			await pi.emit("before_provider_request", {}, capturedCtx);
+			const errors: unknown[] = [];
+			invalidated = true; // old runner invalidated by session replacement
+			try {
+				if (path === "late response") {
+					await pi.emit("after_provider_response", { status: 200 }, capturedCtx);
+				} else {
+					const delay = path === "idle watchdog" ? 90_000 : 600_000;
+					clock.advance(delay);
+					timers.fireByDelay(delay);
+				}
+			} catch (error) {
+				errors.push(error);
+			}
+			assert.deepEqual(errors, [], "runtime extension-error channel must remain empty after replacement");
+			assert.equal(state.aborts, 0);
+		});
+	});
+}
+
+test("TASK-4 only documented stale errors are dropped; unrelated failures reach error channel unchanged", async () => {
+	await withTempConfig(async () => {
+		for (const error of [new Error("unrelated accessor defect"), new Error("ctx is stale"), "ctx is stale after session replacement or reload"]) {
+			const { pi, ctx } = createHarness();
+			Object.defineProperty(ctx, "model", { get() { throw error; } });
+			const errors: unknown[] = [];
+			try { await pi.emit("after_provider_response", { status: 200 }, ctx); }
+			catch (reported) { errors.push(reported); }
+			assert.deepEqual(errors, [error]);
+		}
+	});
+});
