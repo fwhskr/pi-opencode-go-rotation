@@ -223,7 +223,31 @@ test("rotation prefers confirmed headroom over exhausted accounts and cooldowns"
 	});
 });
 
- test("usage helpers parse the upstream response shape", () => {
+test("rolling quota reset replaces a long cooldown and becomes selectable at reset", async () => {
+	await withTempConfig(async (configPath) => {
+		patchConfig(configPath, { cooldowns: { 0: 0 }, activeKeyIndex: 1 });
+		const { pi, ctx, state, clock } = createHarness("runtime", async () =>
+			usageResponse([{ name: "rolling", status: "rate-limited", resetInSec: 60 }]));
+		await pi.emit("before_provider_request", {}, ctx);
+		await pi.emit("after_provider_response", { status: 429 }, ctx);
+		assert.equal(readConfig(configPath).quotaBlockedUntil?.["0"], 60000);
+		assert.equal(readConfig(configPath).cooldowns["0"], undefined);
+		assert.match(state.notifications.join("\n"), /all configured keys.*quota-blocked/i);
+		const applied = [...state.runtimeKeys];
+		await pi.emit("before_provider_request", {}, ctx);
+		await pi.emit("after_provider_response", { status: 429 }, ctx);
+		assert.deepEqual(state.runtimeKeys, applied, "no known limited key is re-selected before reset");
+		assert.equal(readConfig(configPath).activeKeyIndex, 1);
+		clock.advance(60001);
+		patchConfig(configPath, { activeKeyIndex: 0 });
+		await pi.emit("before_provider_request", {}, ctx);
+		assert.equal(readConfig(configPath).quotaBlockedUntil?.["0"], 60000);
+		assert.equal(readConfig(configPath).cooldowns["0"], undefined);
+		assert.equal(state.runtimeKeys.at(-1), "sk-one");
+	});
+});
+
+test("usage helpers parse the upstream response shape", () => {
 	const rollingWindow = {
 		name: "rolling",
 		status: "active",
@@ -508,7 +532,8 @@ test("fixed-window quota errors fall back to the cooldown when no reset is parse
 
 test("response quota rotation and message_end cannot rotate twice", async () => {
 	await withTempConfig(async (configPath) => {
-		const fetch: FetchApi = async () => ({
+		const fetch: FetchApi = async (_url, init) => init.headers.Authorization !== "Bearer sk-one"
+			? { ok: false, status: 503, json: async () => ({}) } : ({
 			ok: true,
 			status: 200,
 			json: async () => ({ windows: [{ name: "weekly", status: "rate-limited", resetInSec: 3_600 }] }),
@@ -617,7 +642,8 @@ test("an unmatched 429 response cannot rotate after another provider request sta
 
 test("sequential quota failures try each key once and then stop", async () => {
 	await withTempConfig(async (configPath) => {
-		const fetch: FetchApi = async () => ({
+		const fetch: FetchApi = async (_url, init) => init.headers.Authorization !== `Bearer ${readConfig(configPath).keys[readConfig(configPath).activeKeyIndex].key}`
+			? { ok: false, status: 503, json: async () => ({}) } : ({
 			ok: true,
 			status: 200,
 			json: async () => ({ windows: [{ name: "weekly", status: "rate-limited", resetInSec: 3_600 }] }),
@@ -677,7 +703,8 @@ test("quota exhaustion falls back to a cooling key instead of keeping the blocke
 			...persisted,
 			cooldowns: { 1: 0, 2: 0 },
 		}), { mode: 0o600 });
-		const fetch: FetchApi = async () => ({
+		const fetch: FetchApi = async (_url, init) => init.headers.Authorization !== "Bearer sk-one"
+			? { ok: false, status: 503, json: async () => ({}) } : ({
 			ok: true,
 			status: 200,
 			json: async () => ({ windows: [{ name: "weekly", status: "rate-limited", resetInSec: 3_600 }] }),
@@ -881,7 +908,8 @@ test("unknown command help lists the quota alias", async () => {
 
 test("http 429 rotates and persists the latest authoritative usage reset", async () => {
 	await withTempConfig(async (configPath) => {
-		const fetch: FetchApi = async () => ({
+		const fetch: FetchApi = async (_url, init) => init.headers.Authorization !== "Bearer sk-one"
+			? { ok: false, status: 503, json: async () => ({}) } : ({
 			ok: true,
 			status: 200,
 			json: async () => ({
@@ -908,7 +936,8 @@ test("http 429 rotates and persists the latest authoritative usage reset", async
 test("http 401 verifies monthly quota and rotates once before retry", async () => {
 	await withTempConfig(async (configPath) => {
 		const reset = "2026-09-01T00:00:00Z";
-		const fetch: FetchApi = async () => ({
+		const fetch: FetchApi = async (_url, init) => init.headers.Authorization !== "Bearer sk-one"
+			? { ok: false, status: 503, json: async () => ({}) } : ({
 			ok: true, status: 200,
 			json: async () => ({ usage: { monthly: { status: "rate-limited", percent: 100, resetsAt: reset } } }),
 		});
@@ -929,7 +958,8 @@ test("http 401 verifies monthly quota and rotates once before retry", async () =
 
 test("http 401 quota rotation survives a stalled response body without rotating again", async () => {
 	await withTempConfig(async (configPath) => {
-		const { pi, ctx, state, clock, timers } = createHarness("runtime", async () => ({
+		const { pi, ctx, state, clock, timers } = createHarness("runtime", async (_url, init) => init.headers.Authorization !== "Bearer sk-one"
+			? { ok: false, status: 503, json: async () => ({}) } : ({
 			ok: true, status: 200,
 			json: async () => ({ usage: { monthly: { status: "rate-limited", percent: 100, resetsAt: "2026-09-01T00:00:00Z" } } }),
 		}));
